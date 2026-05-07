@@ -1628,6 +1628,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._cardkit_block_streaming = bool(
             resolve_display_setting(user_config or {}, "feishu", "blockStreaming", True)
         )
+        if not self._cardkit_streaming_enabled:
+            self._cardkit_client = None
+            self._cardkit_sessions.clear()
+            self._cardkit_open_by_chat.clear()
+            return
         if self._cardkit_streaming_enabled and self._cardkit_client is None:
             self._cardkit_client = FeishuCardKitClient(
                 FeishuCardKitCredentials(

@@ -4870,3 +4870,21 @@ class TestFeishuCardKitStreamingConfig(unittest.TestCase):
         user_config = {"display": {"platforms": {"feishu": {"blockStreaming": False}}}}
         adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
         self.assertFalse(adapter._cardkit_block_streaming)
+
+    def test_cardkit_disable_clears_runtime_state(self):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        adapter.configure_cardkit_streaming({}, StreamingConfig(enabled=True, transport="edit"))
+        self.assertIsNotNone(adapter._cardkit_client)
+        adapter._cardkit_sessions["message-id"] = object()
+        adapter._cardkit_open_by_chat["chat-id"] = {"message-id": object()}
+
+        user_config = {"display": {"platforms": {"feishu": {"streaming": False}}}}
+        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
+
+        self.assertIsNone(adapter._cardkit_client)
+        self.assertEqual(adapter._cardkit_sessions, {})
+        self.assertEqual(adapter._cardkit_open_by_chat, {})
+        self.assertFalse(adapter.REQUIRES_EDIT_FINALIZE)
