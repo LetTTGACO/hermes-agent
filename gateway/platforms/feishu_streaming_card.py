@@ -94,6 +94,8 @@ def merge_streaming_text(previous_text: Optional[str], next_text: Optional[str])
         return previous
     if next_value.startswith(previous):
         return next_value
+    if previous.startswith(next_value):
+        return previous
     if previous.endswith(next_value):
         return previous
 

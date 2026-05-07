@@ -1,6 +1,3 @@
-import json
-
-
 def test_resolve_api_base_supports_feishu_lark_and_custom():
     from gateway.platforms.feishu_streaming_card import resolve_api_base
 
@@ -39,8 +36,25 @@ def test_merge_streaming_text_preserves_prefix_and_overlap():
 
     assert merge_streaming_text("", "hello") == "hello"
     assert merge_streaming_text("hello", "hello world") == "hello world"
+    assert merge_streaming_text("hello world", "hello") == "hello world"
     assert merge_streaming_text("hello wor", "world") == "hello world"
     assert merge_streaming_text("abc", "xyz") == "abcxyz"
+
+
+def test_truncate_summary_leaves_short_text_and_truncates_long_text():
+    from gateway.platforms.feishu_streaming_card import truncate_summary
+
+    assert truncate_summary("short", max_chars=10) == "short"
+    assert truncate_summary("abcdefghij", max_chars=5) == "abcde"
+
+
+def test_has_natural_streaming_boundary_supports_ascii_and_chinese_punctuation():
+    from gateway.platforms.feishu_streaming_card import has_natural_streaming_boundary
+
+    assert has_natural_streaming_boundary("hello.") is True
+    assert has_natural_streaming_boundary("你好！") is True
+    assert has_natural_streaming_boundary("继续") is False
+    assert has_natural_streaming_boundary("") is False
 
 
 def test_should_push_streaming_update_uses_boundary_and_delta():
