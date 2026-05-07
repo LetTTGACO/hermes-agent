@@ -5139,3 +5139,24 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
         self.assertEqual(second.error, "close failed")
         self.assertIn(first.message_id, adapter._cardkit_sessions)
         self.assertIn(first.message_id, adapter._cardkit_open_by_chat["oc_chat"])
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
+    def test_sibling_close_failure_keeps_unattempted_sessions_indexed(self):
+        adapter = self._adapter()
+        first = asyncio.run(adapter.send("oc_chat", "tool progress"))
+        extra = FailingCloseSession(
+            client=adapter._cardkit_client,
+            chat_id="oc_chat",
+            send_card_reference=adapter._send_cardkit_reference,
+            block_streaming=True,
+        )
+        extra.message_id = "card_msg_extra"
+        extra.current_text = "still open"
+        adapter._cardkit_sessions[extra.message_id] = extra
+        adapter._cardkit_open_by_chat["oc_chat"][extra.message_id] = extra
+
+        result = asyncio.run(adapter.send("oc_chat", "assistant commentary"))
+
+        self.assertFalse(result.success)
+        self.assertIn(first.message_id, adapter._cardkit_open_by_chat["oc_chat"])
+        self.assertIn(extra.message_id, adapter._cardkit_open_by_chat["oc_chat"])

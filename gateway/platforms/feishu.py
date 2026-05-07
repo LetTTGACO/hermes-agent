@@ -1795,19 +1795,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _close_cardkit_siblings(self, chat_id: str) -> None:
         sessions = self._cardkit_open_by_chat.pop(chat_id, {})
+        remaining_sessions = dict(sessions)
         for message_id, session in list(sessions.items()):
             try:
                 result = await session.close(getattr(session, "current_text", None))
             except Exception as exc:
                 logger.debug("[Feishu] CardKit sibling close failed for %s: %s", message_id, exc, exc_info=True)
-                self._cardkit_sessions[message_id] = session
-                self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+                self._cardkit_open_by_chat.setdefault(chat_id, {}).update(remaining_sessions)
                 raise
             if result.success:
                 self._cardkit_sessions.pop(message_id, None)
+                remaining_sessions.pop(message_id, None)
             else:
-                self._cardkit_sessions[message_id] = session
-                self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+                self._cardkit_open_by_chat.setdefault(chat_id, {}).update(remaining_sessions)
                 raise RuntimeError(result.error or "CardKit sibling close failed")
 
     async def _send_cardkit(
