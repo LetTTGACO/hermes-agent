@@ -1768,6 +1768,70 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    def _should_use_cardkit_streaming(self) -> bool:
+        return bool(self._cardkit_streaming_enabled and self._cardkit_client is not None)
+
+    async def _send_cardkit_reference(
+        self,
+        *,
+        card_id: str,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        content = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "card send failed")
+        except Exception as exc:
+            logger.warning("[Feishu] CardKit reference send failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _close_cardkit_siblings(self, chat_id: str) -> None:
+        sessions = self._cardkit_open_by_chat.pop(chat_id, {})
+        for message_id, session in list(sessions.items()):
+            try:
+                await session.close(getattr(session, "current_text", None))
+            except Exception as exc:
+                logger.debug("[Feishu] CardKit sibling close failed for %s: %s", message_id, exc, exc_info=True)
+            finally:
+                self._cardkit_sessions.pop(message_id, None)
+
+    async def _send_cardkit(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        if not self._cardkit_client:
+            return SendResult(success=False, error="CardKit client not configured")
+        await self._close_cardkit_siblings(chat_id)
+        session = FeishuStreamingCardSession(
+            client=self._cardkit_client,
+            chat_id=chat_id,
+            send_card_reference=self._send_cardkit_reference,
+            block_streaming=self._cardkit_block_streaming,
+        )
+        result = await session.start(content, reply_to=reply_to, metadata=metadata)
+        if not result.success or not result.message_id:
+            return result
+        if not hasattr(session, "current_text"):
+            setattr(session, "current_text", content)
+        if reply_to is not None:
+            await session.close(content)
+            return result
+        self._cardkit_sessions[result.message_id] = session
+        self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
+        return result
+
     async def send(
         self,
         chat_id: str,
@@ -1778,6 +1842,14 @@ class FeishuAdapter(BasePlatformAdapter):
         """Send a Feishu message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+
+        if self._should_use_cardkit_streaming():
+            return await self._send_cardkit(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
