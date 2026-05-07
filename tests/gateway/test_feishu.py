@@ -5049,3 +5049,43 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "normal_msg")
         adapter._client.im.v1.message.update.assert_called_once()
+
+
+class FailingStartSession(FakeCardSession):
+    async def start(self, content, *, reply_to, metadata):
+        return SimpleNamespace(success=False, error="create card failed", message_id=None)
+
+
+class TestFeishuCardKitFallbacks(unittest.TestCase):
+    def _adapter(self, enabled):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        adapter._client = SimpleNamespace()
+        if enabled:
+            adapter.configure_cardkit_streaming(
+                {"display": {"platforms": {"feishu": {"streaming": True}}}},
+                StreamingConfig(enabled=False, transport="edit"),
+            )
+        return adapter
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingStartSession)
+    def test_cardkit_first_send_failure_returns_unsuccessful_result(self):
+        adapter = self._adapter(enabled=True)
+
+        result = asyncio.run(adapter.send("oc_chat", "hello"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "create card failed")
+
+    def test_cardkit_disabled_uses_existing_send_path(self):
+        adapter = self._adapter(enabled=False)
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="normal_msg"))
+        adapter._feishu_send_with_retry = AsyncMock(return_value=response)
+
+        result = asyncio.run(adapter.send("oc_chat", "hello"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "normal_msg")
+        adapter._feishu_send_with_retry.assert_awaited_once()
