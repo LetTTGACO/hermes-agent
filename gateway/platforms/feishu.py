@@ -1797,11 +1797,18 @@ class FeishuAdapter(BasePlatformAdapter):
         sessions = self._cardkit_open_by_chat.pop(chat_id, {})
         for message_id, session in list(sessions.items()):
             try:
-                await session.close(getattr(session, "current_text", None))
+                result = await session.close(getattr(session, "current_text", None))
             except Exception as exc:
                 logger.debug("[Feishu] CardKit sibling close failed for %s: %s", message_id, exc, exc_info=True)
-            finally:
+                self._cardkit_sessions[message_id] = session
+                self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+                raise
+            if result.success:
                 self._cardkit_sessions.pop(message_id, None)
+            else:
+                self._cardkit_sessions[message_id] = session
+                self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+                raise RuntimeError(result.error or "CardKit sibling close failed")
 
     async def _send_cardkit(
         self,
@@ -1813,7 +1820,11 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._cardkit_client:
             return SendResult(success=False, error="CardKit client not configured")
-        await self._close_cardkit_siblings(chat_id)
+        try:
+            await self._close_cardkit_siblings(chat_id)
+        except Exception as exc:
+            logger.warning("[Feishu] CardKit sibling close failed before send: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
         session = FeishuStreamingCardSession(
             client=self._cardkit_client,
             chat_id=chat_id,
