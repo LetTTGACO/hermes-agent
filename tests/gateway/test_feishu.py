@@ -4892,9 +4892,11 @@ class TestFeishuCardKitStreamingConfig(unittest.TestCase):
 
 class FakeCardSession:
     counter = 0
+    instances = []
 
     def __init__(self, *, client, chat_id, send_card_reference, block_streaming):
         FakeCardSession.counter += 1
+        FakeCardSession.instances.append(self)
         self.chat_id = chat_id
         self.message_id = f"card_msg_{FakeCardSession.counter}"
         self.started = []
@@ -4917,6 +4919,7 @@ class FakeCardSession:
 class TestFeishuCardKitSendLifecycle(unittest.TestCase):
     def setUp(self):
         FakeCardSession.counter = 0
+        FakeCardSession.instances = []
 
     def _adapter(self):
         from gateway.config import PlatformConfig, StreamingConfig
@@ -4938,6 +4941,7 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "card_msg_1")
+        self.assertEqual(FakeCardSession.instances[-1].closed_with, ["final answer"])
         self.assertNotIn("card_msg_1", adapter._cardkit_sessions)
         self.assertEqual(adapter._cardkit_open_by_chat, {})
 
