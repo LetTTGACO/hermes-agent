@@ -159,6 +159,32 @@ def test_session_update_blocks_small_delta_until_close_when_block_streaming_true
     assert client.calls[-1] == ("close", "card_123", "hello there", 4)
 
 
+def test_session_update_flushes_pending_small_delta_after_throttle():
+    from gateway.platforms.feishu_streaming_card import (
+        STREAMING_UPDATE_THROTTLE_MS,
+        FeishuStreamingCardSession,
+    )
+
+    async def run_test():
+        client = FakeCardKitClient()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_chat",
+            send_card_reference=fake_send_card_reference,
+            block_streaming=True,
+        )
+        await session.start("hello", reply_to=None, metadata=None)
+        await session.update("hello there")
+
+        assert ("update", "card_123", "content", "hello there", 3) not in client.calls
+
+        await asyncio.sleep((STREAMING_UPDATE_THROTTLE_MS + 80) / 1000)
+
+        assert ("update", "card_123", "content", "hello there", 3) in client.calls
+
+    asyncio.run(run_test())
+
+
 def test_session_close_disables_streaming_mode_once():
     from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
 

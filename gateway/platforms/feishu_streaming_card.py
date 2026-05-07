@@ -47,7 +47,7 @@ def build_streaming_card() -> Dict[str, Any]:
             "streaming_mode": True,
             "summary": {"content": "[Generating...]"},
             "streaming_config": {
-                "print_frequency_ms": {"default": 70},
+                "print_frequency_ms": {"default": 50},
                 "print_step": {"default": 1},
                 "print_strategy": "fast",
             },
@@ -298,6 +298,7 @@ class FeishuStreamingCardSession:
         self.pending_text: Optional[str] = None
         self.closed = False
         self.last_update_time = 0.0
+        self._pending_flush_task: Optional[asyncio.Task] = None
 
     async def start(
         self,
@@ -357,17 +358,20 @@ class FeishuStreamingCardSession:
             next_text,
             block_streaming=self.block_streaming,
         ):
+            self._schedule_pending_flush()
             return SendResult(success=True, message_id=self.message_id)
         now_ms = time.monotonic() * 1000
         if (
             self.block_streaming
             and now_ms - self.last_update_time < STREAMING_UPDATE_THROTTLE_MS
         ):
+            self._schedule_pending_flush(now_ms=now_ms)
             return SendResult(success=True, message_id=self.message_id)
         await self._push_update(next_text, force=True)
         return SendResult(success=True, message_id=self.message_id)
 
     async def close(self, final_text: Optional[str] = None) -> SendResult:
+        self._cancel_pending_flush()
         if self.closed:
             return SendResult(success=True, message_id=self.message_id)
         if not self.card_id or not self.message_id:
@@ -402,6 +406,49 @@ class FeishuStreamingCardSession:
             return SendResult(success=False, message_id=self.message_id, error=str(exc))
         self.closed = True
         return SendResult(success=True, message_id=self.message_id)
+
+    def _schedule_pending_flush(self, *, now_ms: Optional[float] = None) -> None:
+        if not self.block_streaming or self.closed or not self.pending_text:
+            return
+        if self._pending_flush_task and not self._pending_flush_task.done():
+            return
+        if now_ms is None:
+            now_ms = time.monotonic() * 1000
+        elapsed_ms = now_ms - self.last_update_time
+        delay_ms = max(0.0, STREAMING_UPDATE_THROTTLE_MS - elapsed_ms)
+        self._pending_flush_task = asyncio.create_task(
+            self._flush_pending_after_delay(delay_ms / 1000)
+        )
+
+    def _cancel_pending_flush(self) -> None:
+        task = self._pending_flush_task
+        self._pending_flush_task = None
+        if task and not task.done():
+            task.cancel()
+
+    async def _flush_pending_after_delay(self, delay_seconds: float) -> None:
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            if self.closed or not self.card_id or not self.message_id:
+                return
+            text = self.pending_text
+            if not text or text == self.current_text:
+                return
+            await self._push_update(text, force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] CardKit pending flush failed for %s: %s",
+                self.card_id,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            task = asyncio.current_task()
+            if self._pending_flush_task is task:
+                self._pending_flush_task = None
 
     async def _push_update(self, text: str, *, force: bool) -> None:
         if not self.card_id:
