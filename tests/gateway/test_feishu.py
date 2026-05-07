@@ -4916,6 +4916,18 @@ class FakeCardSession:
         return SimpleNamespace(success=True, message_id=self.message_id)
 
 
+class FakeCardStartFailureSession(FakeCardSession):
+    async def start(self, content, *, reply_to, metadata):
+        self.started.append((content, reply_to, metadata))
+        return SimpleNamespace(success=False, error="create card failed", message_id=None)
+
+
+class FakeCardStartRaisesSession(FakeCardSession):
+    async def start(self, content, *, reply_to, metadata):
+        self.started.append((content, reply_to, metadata))
+        raise RuntimeError("boom")
+
+
 class TestFeishuCardKitSendLifecycle(unittest.TestCase):
     def setUp(self):
         FakeCardSession.counter = 0
@@ -4967,3 +4979,25 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
         self.assertEqual(first_session.closed_with, ["tool progress"])
         self.assertNotIn(first.message_id, adapter._cardkit_sessions)
         self.assertIn(second.message_id, adapter._cardkit_sessions)
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardStartFailureSession)
+    def test_send_start_failure_returns_unsuccessful_without_tracking(self):
+        adapter = self._adapter()
+
+        result = asyncio.run(adapter.send("oc_chat", "stream chunk"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "create card failed")
+        self.assertEqual(adapter._cardkit_sessions, {})
+        self.assertEqual(adapter._cardkit_open_by_chat, {})
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardStartRaisesSession)
+    def test_send_start_exception_returns_unsuccessful_without_tracking(self):
+        adapter = self._adapter()
+
+        result = asyncio.run(adapter.send("oc_chat", "stream chunk"))
+
+        self.assertFalse(result.success)
+        self.assertIn("boom", result.error)
+        self.assertEqual(adapter._cardkit_sessions, {})
+        self.assertEqual(adapter._cardkit_open_by_chat, {})

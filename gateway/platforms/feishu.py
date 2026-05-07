@@ -1820,7 +1820,11 @@ class FeishuAdapter(BasePlatformAdapter):
             send_card_reference=self._send_cardkit_reference,
             block_streaming=self._cardkit_block_streaming,
         )
-        result = await session.start(content, reply_to=reply_to, metadata=metadata)
+        try:
+            result = await session.start(content, reply_to=reply_to, metadata=metadata)
+        except Exception as exc:
+            logger.warning("[Feishu] CardKit send failed during start: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
         if not result.success or not result.message_id:
             return result
         if not hasattr(session, "current_text"):
