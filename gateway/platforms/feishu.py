@@ -1913,6 +1913,25 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        session = self._cardkit_sessions.get(message_id)
+        if session is not None:
+            try:
+                if finalize:
+                    result = await session.close(content)
+                    self._cardkit_sessions.pop(message_id, None)
+                    chat_sessions = self._cardkit_open_by_chat.get(chat_id)
+                    if chat_sessions:
+                        chat_sessions.pop(message_id, None)
+                        if not chat_sessions:
+                            self._cardkit_open_by_chat.pop(chat_id, None)
+                    return result
+                result = await session.update(content)
+                self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+                return result
+            except Exception as exc:
+                logger.warning("[Feishu] CardKit edit failed for %s: %s", message_id, exc, exc_info=True)
+                return SendResult(success=False, error=str(exc), message_id=message_id)
+
         content = self.format_message(content)
         try:
             msg_type, payload = self._build_outbound_payload(content)

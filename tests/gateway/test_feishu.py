@@ -5001,3 +5001,51 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
         self.assertIn("boom", result.error)
         self.assertEqual(adapter._cardkit_sessions, {})
         self.assertEqual(adapter._cardkit_open_by_chat, {})
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardSession)
+    def test_edit_message_updates_open_card_and_keeps_it_open(self):
+        adapter = self._adapter()
+        sent = asyncio.run(adapter.send("oc_chat", "hello"))
+        session = adapter._cardkit_sessions[sent.message_id]
+
+        result = asyncio.run(adapter.edit_message("oc_chat", sent.message_id, "hello world", finalize=False))
+
+        self.assertTrue(result.success)
+        self.assertIn(sent.message_id, adapter._cardkit_sessions)
+        self.assertIn(("update", "hello world"), session.started)
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardSession)
+    def test_edit_message_finalize_closes_and_removes_card(self):
+        adapter = self._adapter()
+        sent = asyncio.run(adapter.send("oc_chat", "hello"))
+        session = adapter._cardkit_sessions[sent.message_id]
+
+        result = asyncio.run(adapter.edit_message("oc_chat", sent.message_id, "hello final", finalize=True))
+
+        self.assertTrue(result.success)
+        self.assertEqual(session.closed_with, ["hello final"])
+        self.assertNotIn(sent.message_id, adapter._cardkit_sessions)
+        self.assertNotIn("oc_chat", adapter._cardkit_open_by_chat)
+
+    def test_edit_message_unknown_card_uses_existing_update_path(self):
+        adapter = self._adapter()
+        adapter._cardkit_streaming_enabled = True
+        adapter._cardkit_client = object()
+
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="normal_msg"),
+        )
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(update=Mock(return_value=response))
+                )
+            )
+        )
+
+        result = asyncio.run(adapter.edit_message("oc_chat", "normal_msg", "updated text", finalize=True))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "normal_msg")
+        adapter._client.im.v1.message.update.assert_called_once()
