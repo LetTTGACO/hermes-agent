@@ -127,6 +127,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from gateway.display_config import resolve_display_setting
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -138,6 +139,12 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+)
+from gateway.platforms.feishu_streaming_card import (
+    FeishuCardKitClient,
+    FeishuCardKitCredentials,
+    FeishuStreamingCardSession,
+    resolve_receive_id_type,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -1407,6 +1414,16 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        self._cardkit_streaming_enabled = False
+        self._cardkit_block_streaming = True
+        self._cardkit_client: Optional[FeishuCardKitClient] = None
+        self._cardkit_sessions: Dict[str, FeishuStreamingCardSession] = {}
+        self._cardkit_open_by_chat: Dict[str, Dict[str, FeishuStreamingCardSession]] = {}
+        try:
+            user_config, streaming_config = self._load_cardkit_streaming_config()
+            self.configure_cardkit_streaming(user_config, streaming_config)
+        except Exception:
+            logger.debug("[Feishu] CardKit streaming default configuration failed", exc_info=True)
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1539,6 +1556,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        if getattr(self, "_cardkit_client", None) is not None:
+            self._cardkit_client = FeishuCardKitClient(
+                FeishuCardKitCredentials(
+                    app_id=self._app_id,
+                    app_secret=self._app_secret,
+                    domain=self._domain_name,
+                )
+            )
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1567,6 +1592,50 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             .build()
         )
+
+    @property
+    def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
+        return True
+
+    @property
+    def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
+        return bool(self._cardkit_streaming_enabled)
+
+    def _load_cardkit_streaming_config(self) -> tuple[Dict[str, Any], Any]:
+        from gateway.config import StreamingConfig
+
+        config_path = get_hermes_home() / "config.yaml"
+        if not config_path.exists():
+            return {}, StreamingConfig()
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as handle:
+                user_config = yaml.safe_load(handle) or {}
+        except Exception:
+            logger.debug("[Feishu] Failed to read CardKit streaming config", exc_info=True)
+            return {}, StreamingConfig()
+        if not isinstance(user_config, dict):
+            return {}, StreamingConfig()
+        streaming_config = StreamingConfig.from_dict(user_config.get("streaming") or {})
+        return user_config, streaming_config
+
+    def configure_cardkit_streaming(self, user_config: Dict[str, Any], streaming_config: Any) -> None:
+        plat_streaming = resolve_display_setting(user_config or {}, "feishu", "streaming")
+        transport = str(getattr(streaming_config, "transport", "edit") or "edit").lower()
+        global_enabled = bool(getattr(streaming_config, "enabled", False))
+        enabled = global_enabled if plat_streaming is None else bool(plat_streaming)
+        self._cardkit_streaming_enabled = bool(enabled and transport != "off")
+        self._cardkit_block_streaming = bool(
+            resolve_display_setting(user_config or {}, "feishu", "blockStreaming", True)
+        )
+        if self._cardkit_streaming_enabled and self._cardkit_client is None:
+            self._cardkit_client = FeishuCardKitClient(
+                FeishuCardKitCredentials(
+                    app_id=self._app_id,
+                    app_secret=self._app_secret,
+                    domain=self._domain_name,
+                )
+            )
 
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""

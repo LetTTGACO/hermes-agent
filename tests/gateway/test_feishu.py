@@ -4823,3 +4823,50 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         # Body: leading @Hermes stripped, Alice preserved, trailing text intact.
         self.assertIn("@Alice review the spec with Alice", event.text)
         self.assertNotIn("@Hermes @Alice", event.text)
+
+
+class TestFeishuCardKitStreamingConfig(unittest.TestCase):
+    def test_cardkit_streaming_inherits_global_streaming_enabled(self):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        adapter.configure_cardkit_streaming({}, StreamingConfig(enabled=True, transport="edit"))
+
+        self.assertTrue(adapter._cardkit_streaming_enabled)
+        self.assertTrue(adapter.SUPPORTS_MESSAGE_EDITING)
+        self.assertTrue(adapter.REQUIRES_EDIT_FINALIZE)
+
+    def test_cardkit_streaming_platform_override_wins(self):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        user_config = {"display": {"platforms": {"feishu": {"streaming": False}}}}
+        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
+
+        self.assertFalse(adapter._cardkit_streaming_enabled)
+        self.assertTrue(adapter.SUPPORTS_MESSAGE_EDITING)
+        self.assertFalse(adapter.REQUIRES_EDIT_FINALIZE)
+
+    def test_cardkit_streaming_transport_off_disables_even_with_override(self):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        user_config = {"display": {"platforms": {"feishu": {"streaming": True}}}}
+        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="off"))
+
+        self.assertFalse(adapter._cardkit_streaming_enabled)
+
+    def test_cardkit_block_streaming_defaults_true_and_can_disable(self):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        adapter.configure_cardkit_streaming({}, StreamingConfig(enabled=True, transport="edit"))
+        self.assertTrue(adapter._cardkit_block_streaming)
+
+        user_config = {"display": {"platforms": {"feishu": {"blockStreaming": False}}}}
+        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
+        self.assertFalse(adapter._cardkit_block_streaming)
