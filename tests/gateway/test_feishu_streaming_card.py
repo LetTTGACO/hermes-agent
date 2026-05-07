@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 
@@ -174,3 +175,138 @@ def test_session_close_disables_streaming_mode_once():
 
     close_calls = [call for call in client.calls if call[0] == "close"]
     assert close_calls == [("close", "card_123", "hello final", 4)]
+
+
+def test_session_close_attempts_close_card_when_final_update_fails():
+    from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
+
+    class FailingFinalUpdateClient(FakeCardKitClient):
+        async def update_element_content(self, card_id, element_id, content, sequence):
+            if content == "hello final":
+                self.calls.append(
+                    ("update_failed", card_id, element_id, content, sequence)
+                )
+                raise RuntimeError("update failed")
+            await super().update_element_content(card_id, element_id, content, sequence)
+
+    client = FailingFinalUpdateClient()
+    session = FeishuStreamingCardSession(
+        client=client,
+        chat_id="oc_chat",
+        send_card_reference=fake_send_card_reference,
+        block_streaming=True,
+    )
+    asyncio.run(session.start("hello", reply_to=None, metadata=None))
+
+    result = asyncio.run(session.close("hello final"))
+
+    assert result.success is True
+    assert ("update_failed", "card_123", "content", "hello final", 3) in client.calls
+    assert ("close", "card_123", "hello final", 4) in client.calls
+
+
+def test_cardkit_client_create_uses_keyword_request_json_and_caches_token():
+    from gateway.platforms.feishu_streaming_card import (
+        FeishuCardKitClient,
+        FeishuCardKitCredentials,
+        _TOKEN_CACHE,
+    )
+
+    calls = []
+
+    async def request_json(method, url, *, headers, body):
+        calls.append((method, url, headers, body))
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant_token", "expire": 7200}
+        if url.endswith("/cardkit/v1/cards"):
+            return {"code": 0, "data": {"card_id": "card_123"}}
+        return {"code": 0}
+
+    _TOKEN_CACHE.clear()
+    try:
+        client = FeishuCardKitClient(
+            FeishuCardKitCredentials(
+                app_id="app_id",
+                app_secret="app_secret",
+                domain="https://open.example.test/",
+            ),
+            request_json=request_json,
+        )
+
+        card_id = asyncio.run(client.create_card())
+        asyncio.run(client.update_element_content("card_123", "content", "hello", 7))
+    finally:
+        _TOKEN_CACHE.clear()
+
+    assert card_id == "card_123"
+    token_call, create_call, update_call = calls
+    assert token_call[0] == "POST"
+    assert token_call[1] == (
+        "https://open.example.test/open-apis/auth/v3/tenant_access_token/internal"
+    )
+    assert token_call[2] == {"Content-Type": "application/json; charset=utf-8"}
+    assert token_call[3] == {"app_id": "app_id", "app_secret": "app_secret"}
+
+    assert create_call[0] == "POST"
+    assert create_call[1] == "https://open.example.test/open-apis/cardkit/v1/cards"
+    assert create_call[2]["Authorization"] == "Bearer tenant_token"
+    assert create_call[3]["type"] == "card_json"
+    assert json.loads(create_call[3]["data"])["schema"] == "2.0"
+
+    assert update_call[0] == "PUT"
+    assert update_call[1] == (
+        "https://open.example.test/open-apis/cardkit/v1/cards/"
+        "card_123/elements/content/content"
+    )
+    assert update_call[2]["Authorization"] == "Bearer tenant_token"
+    assert update_call[3]["sequence"] == 7
+    assert update_call[3]["uuid"] == "s_card_123_7"
+    assert update_call[3]["content"] == "hello"
+    assert [call[1] for call in calls].count(token_call[1]) == 1
+
+
+def test_cardkit_client_update_truncates_content_and_close_sends_settings():
+    from gateway.platforms.feishu_streaming_card import (
+        MAX_CARD_TEXT_LENGTH,
+        FeishuCardKitClient,
+        FeishuCardKitCredentials,
+        _TOKEN_CACHE,
+    )
+
+    calls = []
+
+    async def request_json(method, url, *, headers, body):
+        calls.append((method, url, headers, body))
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant_token", "expire": 7200}
+        return {"code": 0}
+
+    _TOKEN_CACHE.clear()
+    try:
+        client = FeishuCardKitClient(
+            FeishuCardKitCredentials(app_id="app_id", app_secret="app_secret"),
+            request_json=request_json,
+        )
+
+        long_content = "x" * (MAX_CARD_TEXT_LENGTH + 5)
+        asyncio.run(
+            client.update_element_content("card_123", "content", long_content, 7)
+        )
+        asyncio.run(client.close_card("card_123", "final text", 8))
+    finally:
+        _TOKEN_CACHE.clear()
+
+    update_call = calls[1]
+    close_call = calls[2]
+    assert len(update_call[3]["content"]) == MAX_CARD_TEXT_LENGTH
+    assert update_call[3]["sequence"] == 7
+    assert update_call[3]["uuid"] == "s_card_123_7"
+
+    assert close_call[0] == "PATCH"
+    assert close_call[1].endswith("/cardkit/v1/cards/card_123/settings")
+    assert close_call[2]["Authorization"] == "Bearer tenant_token"
+    settings = json.loads(close_call[3]["settings"])
+    assert settings["config"]["streaming_mode"] is False
+    assert settings["config"]["summary"]["content"] == "final text"
+    assert close_call[3]["sequence"] == 8
+    assert close_call[3]["uuid"] == "c_card_123_8"

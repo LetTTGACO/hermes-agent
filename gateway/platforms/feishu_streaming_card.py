@@ -6,9 +6,8 @@ import asyncio
 import json
 import logging
 import time
-import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -121,6 +120,18 @@ class FeishuCardKitCredentials:
     domain: str = "feishu"
 
 
+class RequestJson(Protocol):
+    async def __call__(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Dict[str, str],
+        body: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        ...
+
+
 def _request_json_sync(
     method: str,
     url: str,
@@ -148,12 +159,7 @@ class FeishuCardKitClient:
         self,
         credentials: FeishuCardKitCredentials,
         *,
-        request_json: Optional[
-            Callable[
-                [str, str, Dict[str, str], Optional[Dict[str, Any]]],
-                Awaitable[Dict[str, Any]],
-            ]
-        ] = None,
+        request_json: Optional[RequestJson] = None,
     ):
         self.credentials = credentials
         self.api_base = resolve_api_base(credentials.domain)
@@ -172,7 +178,7 @@ class FeishuCardKitClient:
             headers["Authorization"] = f"Bearer {token}"
         url = f"{self.api_base}{path}"
         if self._request_json is not None:
-            return await self._request_json(method, url, headers, body)
+            return await self._request_json(method, url, headers=headers, body=body)
         return await asyncio.to_thread(
             _request_json_sync,
             method,
@@ -292,7 +298,6 @@ class FeishuStreamingCardSession:
         self.pending_text: Optional[str] = None
         self.closed = False
         self.last_update_time = 0.0
-        self._queue: asyncio.Future | None = None
 
     async def start(
         self,
@@ -352,15 +357,26 @@ class FeishuStreamingCardSession:
             return SendResult(success=True, message_id=self.message_id)
         if not self.card_id or not self.message_id:
             return SendResult(success=False, error="CardKit session is not active")
-        self.closed = True
         merged = merge_streaming_text(self.current_text, self.pending_text)
         if final_text:
             merged = merge_streaming_text(merged, strip_streaming_cursor(final_text))
         if merged and merged != self.current_text:
-            await self._push_update(merged, force=True)
+            try:
+                await self._push_update(merged, force=True)
+            except Exception as exc:
+                logger.warning(
+                    "[Feishu] CardKit final update failed for %s: %s",
+                    self.card_id,
+                    exc,
+                    exc_info=True,
+                )
         self.sequence += 1
         try:
-            await self.client.close_card(self.card_id, self.current_text, self.sequence)
+            await self.client.close_card(
+                self.card_id,
+                merged or self.current_text,
+                self.sequence,
+            )
         except Exception as exc:
             logger.warning(
                 "[Feishu] CardKit close failed for %s: %s",
@@ -368,6 +384,7 @@ class FeishuStreamingCardSession:
                 exc,
                 exc_info=True,
             )
+        self.closed = True
         return SendResult(success=True, message_id=self.message_id)
 
     async def _push_update(self, text: str, *, force: bool) -> None:
