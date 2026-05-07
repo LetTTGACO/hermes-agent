@@ -352,7 +352,10 @@ class TestStreamingPerPlatform:
         """display.platforms.feishu.streaming has priority over streaming.enabled."""
         from gateway.display_config import resolve_display_setting
 
-        config = {"display": {"platforms": {"feishu": {"streaming": True}}}}
+        config = {
+            "streaming": {"enabled": False},
+            "display": {"platforms": {"feishu": {"streaming": True}}},
+        }
 
         assert resolve_display_setting(config, "feishu", "streaming") is True
 
