@@ -5056,6 +5056,12 @@ class FailingStartSession(FakeCardSession):
         return SimpleNamespace(success=False, error="create card failed", message_id=None)
 
 
+class FailingCloseSession(FakeCardSession):
+    async def close(self, final_text=None):
+        self.closed_with.append(final_text)
+        return SimpleNamespace(success=False, error="close failed", message_id=self.message_id)
+
+
 class TestFeishuCardKitFallbacks(unittest.TestCase):
     def _adapter(self, enabled):
         from gateway.config import PlatformConfig, StreamingConfig
@@ -5089,3 +5095,35 @@ class TestFeishuCardKitFallbacks(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "normal_msg")
         adapter._feishu_send_with_retry.assert_awaited_once()
+
+
+class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
+    def setUp(self):
+        FakeCardSession.counter = 0
+        FakeCardSession.instances = []
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        adapter._client = SimpleNamespace()
+        adapter.configure_cardkit_streaming(
+            {"display": {"platforms": {"feishu": {"streaming": True}}}},
+            StreamingConfig(enabled=False, transport="edit"),
+        )
+        return adapter
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
+    def test_finalize_failure_keeps_cardkit_session_tracked(self):
+        adapter = self._adapter()
+        sent = asyncio.run(adapter.send("oc_chat", "hello"))
+        session = adapter._cardkit_sessions[sent.message_id]
+
+        result = asyncio.run(adapter.edit_message("oc_chat", sent.message_id, "hello final", finalize=True))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "close failed")
+        self.assertEqual(session.closed_with, ["hello final"])
+        self.assertIn(sent.message_id, adapter._cardkit_sessions)
+        self.assertIn(sent.message_id, adapter._cardkit_open_by_chat["oc_chat"])

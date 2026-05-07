@@ -320,7 +320,22 @@ class FeishuStreamingCardSession:
         self.message_id = send_result.message_id
         text = strip_streaming_cursor(initial_text)
         if text:
-            await self._push_update(text, force=True)
+            try:
+                await self._push_update(text, force=True)
+            except Exception as exc:
+                logger.warning(
+                    "[Feishu] CardKit initial update failed for %s: %s",
+                    self.card_id,
+                    exc,
+                    exc_info=True,
+                )
+                await self.close(None)
+                return SendResult(
+                    success=False,
+                    message_id=self.message_id,
+                    error=str(exc),
+                    raw_response=getattr(send_result, "raw_response", None),
+                )
         return SendResult(
             success=True,
             message_id=self.message_id,
@@ -384,6 +399,7 @@ class FeishuStreamingCardSession:
                 exc,
                 exc_info=True,
             )
+            return SendResult(success=False, message_id=self.message_id, error=str(exc))
         self.closed = True
         return SendResult(success=True, message_id=self.message_id)
 

@@ -205,6 +205,56 @@ def test_session_close_attempts_close_card_when_final_update_fails():
     assert ("close", "card_123", "hello final", 4) in client.calls
 
 
+def test_session_start_closes_card_reference_when_initial_update_fails():
+    from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
+
+    class FailingInitialUpdateClient(FakeCardKitClient):
+        async def update_element_content(self, card_id, element_id, content, sequence):
+            self.calls.append(("update_failed", card_id, element_id, content, sequence))
+            raise RuntimeError("initial update failed")
+
+    client = FailingInitialUpdateClient()
+    session = FeishuStreamingCardSession(
+        client=client,
+        chat_id="oc_chat",
+        send_card_reference=fake_send_card_reference,
+        block_streaming=True,
+    )
+
+    result = asyncio.run(session.start("hello", reply_to=None, metadata=None))
+
+    assert result.success is False
+    assert "initial update failed" in result.error
+    assert result.message_id == "msg_for_card_123"
+    assert ("update_failed", "card_123", "content", "hello", 2) in client.calls
+    assert ("close", "card_123", "", 3) in client.calls
+
+
+def test_session_close_reports_failure_when_close_card_fails():
+    from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
+
+    class FailingCloseClient(FakeCardKitClient):
+        async def close_card(self, card_id, final_text, sequence):
+            self.calls.append(("close_failed", card_id, final_text, sequence))
+            raise RuntimeError("close failed")
+
+    client = FailingCloseClient()
+    session = FeishuStreamingCardSession(
+        client=client,
+        chat_id="oc_chat",
+        send_card_reference=fake_send_card_reference,
+        block_streaming=True,
+    )
+    asyncio.run(session.start("hello", reply_to=None, metadata=None))
+
+    result = asyncio.run(session.close("hello final"))
+
+    assert result.success is False
+    assert "close failed" in result.error
+    assert session.closed is False
+    assert ("close_failed", "card_123", "hello final", 4) in client.calls
+
+
 def test_cardkit_client_create_uses_keyword_request_json_and_caches_token():
     from gateway.platforms.feishu_streaming_card import (
         FeishuCardKitClient,

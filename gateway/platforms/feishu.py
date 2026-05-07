@@ -1830,7 +1830,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if not hasattr(session, "current_text"):
             setattr(session, "current_text", content)
         if reply_to is not None:
-            await session.close(content)
+            close_result = await session.close(content)
+            if not close_result.success:
+                self._cardkit_sessions[result.message_id] = session
+                self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
+                return close_result
             return result
         self._cardkit_sessions[result.message_id] = session
         self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
@@ -1918,12 +1922,13 @@ class FeishuAdapter(BasePlatformAdapter):
             try:
                 if finalize:
                     result = await session.close(content)
-                    self._cardkit_sessions.pop(message_id, None)
-                    chat_sessions = self._cardkit_open_by_chat.get(chat_id)
-                    if chat_sessions:
-                        chat_sessions.pop(message_id, None)
-                        if not chat_sessions:
-                            self._cardkit_open_by_chat.pop(chat_id, None)
+                    if result.success:
+                        self._cardkit_sessions.pop(message_id, None)
+                        chat_sessions = self._cardkit_open_by_chat.get(chat_id)
+                        if chat_sessions:
+                            chat_sessions.pop(message_id, None)
+                            if not chat_sessions:
+                                self._cardkit_open_by_chat.pop(chat_id, None)
                     return result
                 result = await session.update(content)
                 self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
