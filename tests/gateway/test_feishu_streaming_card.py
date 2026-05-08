@@ -2,13 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-
-def test_resolve_api_base_supports_feishu_lark_and_custom():
-    from gateway.platforms.feishu_streaming_card import resolve_api_base
-
-    assert resolve_api_base("feishu") == "https://open.feishu.cn/open-apis"
-    assert resolve_api_base("lark") == "https://open.larksuite.com/open-apis"
-    assert resolve_api_base("https://open.example.test/") == "https://open.example.test/open-apis"
+import pytest
 
 
 def test_resolve_receive_id_type_uses_open_id_for_user_dm():
@@ -27,7 +21,7 @@ def test_build_streaming_card_json_2_0_defaults():
     assert card["config"]["streaming_mode"] is True
     assert card["config"]["summary"] == {"content": "[Generating...]"}
     assert card["config"]["streaming_config"] == {
-        "print_frequency_ms": {"default": 70},
+        "print_frequency_ms": {"default": 50},
         "print_step": {"default": 1},
         "print_strategy": "fast",
     }
@@ -83,10 +77,6 @@ def test_strip_streaming_cursor_removes_gateway_cursor_suffix():
 class FakeCardKitClient:
     def __init__(self):
         self.calls = []
-
-    async def get_token(self):
-        self.calls.append(("token",))
-        return "tenant_token"
 
     async def create_card(self):
         self.calls.append(("create_card",))
@@ -281,108 +271,212 @@ def test_session_close_reports_failure_when_close_card_fails():
     assert ("close_failed", "card_123", "hello final", 4) in client.calls
 
 
-def test_cardkit_client_create_uses_keyword_request_json_and_caches_token():
-    from gateway.platforms.feishu_streaming_card import (
-        FeishuCardKitClient,
-        FeishuCardKitCredentials,
-        _TOKEN_CACHE,
-    )
+class FakeSdkResponse:
+    def __init__(self, *, code=0, msg="", data=None):
+        self.code = code
+        self.msg = msg
+        self.data = data
 
-    calls = []
+    def success(self):
+        return self.code == 0
 
-    async def request_json(method, url, *, headers, body):
-        calls.append((method, url, headers, body))
-        if url.endswith("/auth/v3/tenant_access_token/internal"):
-            return {"code": 0, "tenant_access_token": "tenant_token", "expire": 7200}
-        if url.endswith("/cardkit/v1/cards"):
-            return {"code": 0, "data": {"card_id": "card_123"}}
-        return {"code": 0}
 
-    _TOKEN_CACHE.clear()
-    try:
-        client = FeishuCardKitClient(
-            FeishuCardKitCredentials(
-                app_id="app_id",
-                app_secret="app_secret",
-                domain="https://open.example.test/",
-            ),
-            request_json=request_json,
+class FakeSdkCardId:
+    card_id = "card_123"
+
+
+class FakeSdkCardResource:
+    def __init__(self):
+        self.calls = []
+
+    async def acreate(self, request):
+        self.calls.append(("create", request))
+        return FakeSdkResponse(data=FakeSdkCardId())
+
+    async def asettings(self, request):
+        self.calls.append(("settings", request))
+        return FakeSdkResponse()
+
+
+class FakeSdkCardElementResource:
+    def __init__(self):
+        self.calls = []
+
+    async def acontent(self, request):
+        self.calls.append(("content", request))
+        return FakeSdkResponse()
+
+
+class FakeSdkClient:
+    def __init__(self):
+        self.card = FakeSdkCardResource()
+        self.card_element = FakeSdkCardElementResource()
+        self.cardkit = SimpleNamespace(
+            v1=SimpleNamespace(card=self.card, card_element=self.card_element)
         )
 
-        card_id = asyncio.run(client.create_card())
-        asyncio.run(client.update_element_content("card_123", "content", "hello", 7))
-    finally:
-        _TOKEN_CACHE.clear()
+
+class _FakeSdkModelBuilder:
+    def __init__(self, model_type):
+        self.model = model_type()
+
+    def type(self, value):
+        self.model.type = value
+        return self
+
+    def data(self, value):
+        self.model.data = value
+        return self
+
+    def request_body(self, value):
+        self.model.request_body = value
+        return self
+
+    def card_id(self, value):
+        self.model.card_id = value
+        return self
+
+    def element_id(self, value):
+        self.model.element_id = value
+        return self
+
+    def content(self, value):
+        self.model.content = value
+        return self
+
+    def sequence(self, value):
+        self.model.sequence = value
+        return self
+
+    def uuid(self, value):
+        self.model.uuid = value
+        return self
+
+    def settings(self, value):
+        self.model.settings = value
+        return self
+
+    def build(self):
+        return self.model
+
+
+class _FakeSdkModel:
+    @classmethod
+    def builder(cls):
+        return _FakeSdkModelBuilder(cls)
+
+
+class FakeCreateCardRequestBody(_FakeSdkModel):
+    pass
+
+
+class FakeCreateCardRequest(_FakeSdkModel):
+    pass
+
+
+class FakeContentCardElementRequestBody(_FakeSdkModel):
+    pass
+
+
+class FakeContentCardElementRequest(_FakeSdkModel):
+    pass
+
+
+class FakeSettingsCardRequestBody(_FakeSdkModel):
+    pass
+
+
+class FakeSettingsCardRequest(_FakeSdkModel):
+    pass
+
+
+def install_fake_sdk_models(monkeypatch, module):
+    monkeypatch.setattr(module, "CreateCardRequestBody", FakeCreateCardRequestBody)
+    monkeypatch.setattr(module, "CreateCardRequest", FakeCreateCardRequest)
+    monkeypatch.setattr(
+        module, "ContentCardElementRequestBody", FakeContentCardElementRequestBody
+    )
+    monkeypatch.setattr(module, "ContentCardElementRequest", FakeContentCardElementRequest)
+    monkeypatch.setattr(module, "SettingsCardRequestBody", FakeSettingsCardRequestBody)
+    monkeypatch.setattr(module, "SettingsCardRequest", FakeSettingsCardRequest)
+
+
+def test_cardkit_client_uses_lark_sdk_card_resources(monkeypatch):
+    import gateway.platforms.feishu_streaming_card as streaming_card
+
+    install_fake_sdk_models(monkeypatch, streaming_card)
+    sdk_client = FakeSdkClient()
+    client = streaming_card.FeishuCardKitClient(sdk_client)
+
+    card_id = asyncio.run(client.create_card())
+    asyncio.run(client.update_element_content(card_id, "content", "hello", 7))
+    asyncio.run(client.close_card(card_id, "final text", 8))
 
     assert card_id == "card_123"
-    token_call, create_call, update_call = calls
-    assert token_call[0] == "POST"
-    assert token_call[1] == (
-        "https://open.example.test/open-apis/auth/v3/tenant_access_token/internal"
-    )
-    assert token_call[2] == {"Content-Type": "application/json; charset=utf-8"}
-    assert token_call[3] == {"app_id": "app_id", "app_secret": "app_secret"}
+    create_request = sdk_client.card.calls[0][1]
+    create_body = create_request.request_body
+    assert create_body.type == "card_json"
+    assert json.loads(create_body.data)["schema"] == "2.0"
 
-    assert create_call[0] == "POST"
-    assert create_call[1] == "https://open.example.test/open-apis/cardkit/v1/cards"
-    assert create_call[2]["Authorization"] == "Bearer tenant_token"
-    assert create_call[3]["type"] == "card_json"
-    assert json.loads(create_call[3]["data"])["schema"] == "2.0"
+    content_request = sdk_client.card_element.calls[0][1]
+    content_body = content_request.request_body
+    assert content_request.card_id == "card_123"
+    assert content_request.element_id == "content"
+    assert content_body.content == "hello"
+    assert content_body.sequence == 7
+    assert content_body.uuid == "s_card_123_7"
 
-    assert update_call[0] == "PUT"
-    assert update_call[1] == (
-        "https://open.example.test/open-apis/cardkit/v1/cards/"
-        "card_123/elements/content/content"
-    )
-    assert update_call[2]["Authorization"] == "Bearer tenant_token"
-    assert update_call[3]["sequence"] == 7
-    assert update_call[3]["uuid"] == "s_card_123_7"
-    assert update_call[3]["content"] == "hello"
-    assert [call[1] for call in calls].count(token_call[1]) == 1
-
-
-def test_cardkit_client_update_truncates_content_and_close_sends_settings():
-    from gateway.platforms.feishu_streaming_card import (
-        MAX_CARD_TEXT_LENGTH,
-        FeishuCardKitClient,
-        FeishuCardKitCredentials,
-        _TOKEN_CACHE,
-    )
-
-    calls = []
-
-    async def request_json(method, url, *, headers, body):
-        calls.append((method, url, headers, body))
-        if url.endswith("/auth/v3/tenant_access_token/internal"):
-            return {"code": 0, "tenant_access_token": "tenant_token", "expire": 7200}
-        return {"code": 0}
-
-    _TOKEN_CACHE.clear()
-    try:
-        client = FeishuCardKitClient(
-            FeishuCardKitCredentials(app_id="app_id", app_secret="app_secret"),
-            request_json=request_json,
-        )
-
-        long_content = "x" * (MAX_CARD_TEXT_LENGTH + 5)
-        asyncio.run(
-            client.update_element_content("card_123", "content", long_content, 7)
-        )
-        asyncio.run(client.close_card("card_123", "final text", 8))
-    finally:
-        _TOKEN_CACHE.clear()
-
-    update_call = calls[1]
-    close_call = calls[2]
-    assert len(update_call[3]["content"]) == MAX_CARD_TEXT_LENGTH
-    assert update_call[3]["sequence"] == 7
-    assert update_call[3]["uuid"] == "s_card_123_7"
-
-    assert close_call[0] == "PATCH"
-    assert close_call[1].endswith("/cardkit/v1/cards/card_123/settings")
-    assert close_call[2]["Authorization"] == "Bearer tenant_token"
-    settings = json.loads(close_call[3]["settings"])
+    settings_request = sdk_client.card.calls[1][1]
+    settings_body = settings_request.request_body
+    settings = json.loads(settings_body.settings)
+    assert settings_request.card_id == "card_123"
     assert settings["config"]["streaming_mode"] is False
     assert settings["config"]["summary"]["content"] == "final text"
-    assert close_call[3]["sequence"] == 8
-    assert close_call[3]["uuid"] == "c_card_123_8"
+    assert settings_body.sequence == 8
+    assert settings_body.uuid == "c_card_123_8"
+
+
+def test_cardkit_client_rejects_over_boundary_content_without_truncating(monkeypatch):
+    import gateway.platforms.feishu_streaming_card as streaming_card
+
+    install_fake_sdk_models(monkeypatch, streaming_card)
+    sdk_client = FakeSdkClient()
+    client = streaming_card.FeishuCardKitClient(sdk_client)
+
+    with pytest.raises(ValueError, match="CardKit content exceeds"):
+        asyncio.run(
+            client.update_element_content(
+                "card_123",
+                "content",
+                "x" * (streaming_card.MAX_CARD_TEXT_LENGTH + 1),
+                7,
+            )
+        )
+
+    assert sdk_client.card_element.calls == []
+
+
+def test_cardkit_client_raises_on_sdk_failure(monkeypatch):
+    import gateway.platforms.feishu_streaming_card as streaming_card
+
+    class FailingSdkCardResource(FakeSdkCardResource):
+        async def acreate(self, request):
+            self.calls.append(("create", request))
+            return FakeSdkResponse(code=999, msg="no card permission")
+
+    class FailingSdkClient(FakeSdkClient):
+        def __init__(self):
+            super().__init__()
+            self.card = FailingSdkCardResource()
+            self.cardkit = SimpleNamespace(
+                v1=SimpleNamespace(
+                    card=self.card,
+                    card_element=self.card_element,
+                )
+            )
+
+    install_fake_sdk_models(monkeypatch, streaming_card)
+    client = streaming_card.FeishuCardKitClient(FailingSdkClient())
+
+    with pytest.raises(RuntimeError, match="no card permission"):
+        asyncio.run(client.create_card())

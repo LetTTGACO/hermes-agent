@@ -6,12 +6,26 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from gateway.platforms.base import SendResult
+
+try:
+    from lark_oapi.api.cardkit.v1 import (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+    )
+except ImportError:
+    ContentCardElementRequest = None  # type: ignore[assignment]
+    ContentCardElementRequestBody = None  # type: ignore[assignment]
+    CreateCardRequest = None  # type: ignore[assignment]
+    CreateCardRequestBody = None  # type: ignore[assignment]
+    SettingsCardRequest = None  # type: ignore[assignment]
+    SettingsCardRequestBody = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger("gateway.feishu.streaming_card")
@@ -19,21 +33,9 @@ logger = logging.getLogger("gateway.feishu.streaming_card")
 CARD_CONTENT_ELEMENT_ID = "content"
 STREAMING_UPDATE_THROTTLE_MS = 160
 STREAMING_SIGNIFICANT_DELTA_CHARS = 18
-TOKEN_EXPIRY_SAFETY_SECONDS = 60
 MAX_CARD_TEXT_LENGTH = 30000
-_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 
 _NATURAL_STREAMING_BOUNDARIES = "\n.!?;:。！？；："
-
-
-def resolve_api_base(domain: Optional[str]) -> str:
-    if domain == "lark":
-        return "https://open.larksuite.com/open-apis"
-    if domain == "feishu" or not domain:
-        return "https://open.feishu.cn/open-apis"
-    if domain.startswith(("http://", "https://")):
-        return f"{domain.rstrip('/')}/open-apis"
-    return "https://open.feishu.cn/open-apis"
 
 
 def resolve_receive_id_type(chat_id: str) -> str:
@@ -113,119 +115,63 @@ def strip_streaming_cursor(text: str) -> str:
     return text
 
 
-@dataclass(frozen=True)
-class FeishuCardKitCredentials:
-    app_id: str
-    app_secret: str
-    domain: str = "feishu"
-
-
-class RequestJson(Protocol):
-    async def __call__(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: Dict[str, str],
-        body: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        ...
-
-
-def _request_json_sync(
-    method: str,
-    url: str,
-    *,
-    headers: Dict[str, str],
-    body: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = Request(url, data=data, method=method)
-    for key, value in headers.items():
-        request.add_header(key, value)
-    try:
-        with urlopen(request, timeout=20) as response:
-            payload = response.read().decode("utf-8")
-            return json.loads(payload or "{}")
-    except HTTPError as exc:
-        payload = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Feishu CardKit HTTP {exc.code}: {payload[:300]}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Feishu CardKit request failed: {exc}") from exc
-
-
 class FeishuCardKitClient:
-    def __init__(
-        self,
-        credentials: FeishuCardKitCredentials,
-        *,
-        request_json: Optional[RequestJson] = None,
-    ):
-        self.credentials = credentials
-        self.api_base = resolve_api_base(credentials.domain)
-        self._request_json = request_json
+    def __init__(self, sdk_client: Any):
+        self.sdk_client = sdk_client
 
-    async def _call(
-        self,
-        method: str,
-        path: str,
-        *,
-        token: Optional[str],
-        body: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        url = f"{self.api_base}{path}"
-        if self._request_json is not None:
-            return await self._request_json(method, url, headers=headers, body=body)
-        return await asyncio.to_thread(
-            _request_json_sync,
-            method,
-            url,
-            headers=headers,
-            body=body,
-        )
-
-    async def get_token(self) -> str:
-        cache_key = f"{self.credentials.domain}|{self.credentials.app_id}"
-        cached = _TOKEN_CACHE.get(cache_key)
-        now = time.time()
-        if cached and cached[1] > now + TOKEN_EXPIRY_SAFETY_SECONDS:
-            return cached[0]
-        payload = await self._call(
-            "POST",
-            "/auth/v3/tenant_access_token/internal",
-            token=None,
-            body={
-                "app_id": self.credentials.app_id,
-                "app_secret": self.credentials.app_secret,
-            },
-        )
-        if payload.get("code") != 0 or not payload.get("tenant_access_token"):
-            raise RuntimeError(
-                f"Feishu token error: {payload.get('msg', 'unknown error')}"
+    def _require_models(self) -> None:
+        missing = [
+            name
+            for name, value in (
+                ("CreateCardRequest", CreateCardRequest),
+                ("CreateCardRequestBody", CreateCardRequestBody),
+                ("ContentCardElementRequest", ContentCardElementRequest),
+                ("ContentCardElementRequestBody", ContentCardElementRequestBody),
+                ("SettingsCardRequest", SettingsCardRequest),
+                ("SettingsCardRequestBody", SettingsCardRequestBody),
             )
-        token = str(payload["tenant_access_token"])
-        expire = float(payload.get("expire") or 7200)
-        _TOKEN_CACHE[cache_key] = (token, now + expire)
-        return token
+            if value is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"lark_oapi CardKit models unavailable: {', '.join(missing)}"
+            )
+
+    @staticmethod
+    def _ensure_success(response: Any, action: str) -> None:
+        success = getattr(response, "success", None)
+        if callable(success) and success():
+            return
+        code = getattr(response, "code", None)
+        if code in (0, None) and not callable(success):
+            return
+        message = (
+            getattr(response, "msg", "")
+            or getattr(response, "message", "")
+            or "unknown error"
+        )
+        raise RuntimeError(f"Feishu CardKit {action} failed: {message}")
+
+    def _card_resource(self) -> Any:
+        return self.sdk_client.cardkit.v1.card
+
+    def _card_element_resource(self) -> Any:
+        return self.sdk_client.cardkit.v1.card_element
 
     async def create_card(self) -> str:
-        payload = await self._call(
-            "POST",
-            "/cardkit/v1/cards",
-            token=await self.get_token(),
-            body={
-                "type": "card_json",
-                "data": json.dumps(build_streaming_card(), ensure_ascii=False),
-            },
+        self._require_models()
+        body = (
+            CreateCardRequestBody.builder()
+            .type("card_json")
+            .data(json.dumps(build_streaming_card(), ensure_ascii=False))
+            .build()
         )
-        card_id = (payload.get("data") or {}).get("card_id")
-        if payload.get("code") != 0 or not card_id:
-            raise RuntimeError(
-                f"Feishu create card failed: {payload.get('msg', 'missing card_id')}"
-            )
+        request = CreateCardRequest.builder().request_body(body).build()
+        response = await self._card_resource().acreate(request)
+        self._ensure_success(response, "create card")
+        card_id = getattr(getattr(response, "data", None), "card_id", None)
+        if not card_id:
+            raise RuntimeError("Feishu CardKit create card failed: missing card_id")
         return str(card_id)
 
     async def update_element_content(
@@ -235,44 +181,51 @@ class FeishuCardKitClient:
         content: str,
         sequence: int,
     ) -> None:
-        payload = await self._call(
-            "PUT",
-            f"/cardkit/v1/cards/{card_id}/elements/{element_id}/content",
-            token=await self.get_token(),
-            body={
-                "content": content[:MAX_CARD_TEXT_LENGTH],
-                "sequence": sequence,
-                "uuid": f"s_{card_id}_{sequence}",
-            },
-        )
-        if payload.get("code", 0) not in (0, None):
-            raise RuntimeError(
-                f"Feishu update card failed: {payload.get('msg', 'unknown error')}"
+        self._require_models()
+        if len(content) > MAX_CARD_TEXT_LENGTH:
+            raise ValueError(
+                f"CardKit content exceeds {MAX_CARD_TEXT_LENGTH} characters"
             )
+        body = (
+            ContentCardElementRequestBody.builder()
+            .content(content)
+            .sequence(sequence)
+            .uuid(f"s_{card_id}_{sequence}")
+            .build()
+        )
+        request = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(element_id)
+            .request_body(body)
+            .build()
+        )
+        response = await self._card_element_resource().acontent(request)
+        self._ensure_success(response, "update card")
 
     async def close_card(self, card_id: str, final_text: str, sequence: int) -> None:
-        payload = await self._call(
-            "PATCH",
-            f"/cardkit/v1/cards/{card_id}/settings",
-            token=await self.get_token(),
-            body={
-                "settings": json.dumps(
-                    {
-                        "config": {
-                            "streaming_mode": False,
-                            "summary": {"content": truncate_summary(final_text)},
-                        }
-                    },
-                    ensure_ascii=False,
-                ),
-                "sequence": sequence,
-                "uuid": f"c_{card_id}_{sequence}",
-            },
+        self._require_models()
+        settings = {
+            "config": {
+                "streaming_mode": False,
+                "summary": {"content": truncate_summary(final_text)},
+            }
+        }
+        body = (
+            SettingsCardRequestBody.builder()
+            .settings(json.dumps(settings, ensure_ascii=False))
+            .sequence(sequence)
+            .uuid(f"c_{card_id}_{sequence}")
+            .build()
         )
-        if payload.get("code", 0) not in (0, None):
-            raise RuntimeError(
-                f"Feishu close card failed: {payload.get('msg', 'unknown error')}"
-            )
+        request = (
+            SettingsCardRequest.builder()
+            .card_id(card_id)
+            .request_body(body)
+            .build()
+        )
+        response = await self._card_resource().asettings(request)
+        self._ensure_success(response, "close card")
 
 
 SendCardReference = Callable[..., Awaitable[SendResult]]
