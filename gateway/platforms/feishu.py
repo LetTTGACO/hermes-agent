@@ -1771,15 +1771,15 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> SendResult:
-        if not self._cardkit_client:
+        cardkit_client = self._get_cardkit_client()
+        if not cardkit_client:
             return SendResult(success=False, error="CardKit client not configured")
         try:
             await self._close_cardkit_siblings(chat_id)
         except Exception as exc:
             logger.warning("[Feishu] CardKit sibling close failed before send: %s", exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
         session = FeishuStreamingCardSession(
-            client=self._cardkit_client,
+            client=cardkit_client,
             chat_id=chat_id,
             send_card_reference=self._send_cardkit_reference,
             block_streaming=True,
@@ -1794,11 +1794,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if not hasattr(session, "current_text"):
             setattr(session, "current_text", content)
         if reply_to is not None:
-            close_result = await session.close(content)
+            try:
+                close_result = await session.close(content)
+            except Exception as exc:
+                logger.warning("[Feishu] CardKit one-shot close failed: %s", exc, exc_info=True)
+                return SendResult(
+                    success=False,
+                    error=str(exc),
+                    message_id=result.message_id,
+                    raw_response=getattr(result, "raw_response", None),
+                )
             if not close_result.success:
-                self._cardkit_sessions[result.message_id] = session
-                self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
-                return close_result
+                return SendResult(
+                    success=False,
+                    error=close_result.error or "CardKit one-shot close failed",
+                    message_id=result.message_id,
+                    raw_response=getattr(result, "raw_response", None),
+                )
             return result
         self._cardkit_sessions[result.message_id] = session
         self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
@@ -1869,12 +1881,18 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        if self._get_cardkit_client() is not None:
-            return await self._send_cardkit(
+        if self._should_try_cardkit():
+            cardkit_result = await self._send_cardkit(
                 chat_id,
                 content,
                 reply_to=reply_to,
                 metadata=metadata,
+            )
+            if cardkit_result.success:
+                return cardkit_result
+            logger.warning(
+                "[Feishu] CardKit send setup failed; falling back to standard message: %s",
+                cardkit_result.error,
             )
 
         return await self._send_standard_message(
