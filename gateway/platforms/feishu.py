@@ -1936,7 +1936,8 @@ class FeishuAdapter(BasePlatformAdapter):
                                 self._cardkit_open_by_chat.pop(chat_id, None)
                     return result
                 result = await session.update(content)
-                self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+                if result.success:
+                    self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
                 return result
             except Exception as exc:
                 logger.warning("[Feishu] CardKit edit failed for %s: %s", message_id, exc, exc_info=True)

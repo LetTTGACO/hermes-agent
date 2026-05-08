@@ -4916,6 +4916,12 @@ class FakeCardStartRaisesSession(FakeCardSession):
         raise RuntimeError("boom")
 
 
+class FailingUpdateSession(FakeCardSession):
+    async def update(self, content):
+        self.started.append(("update_failed", content))
+        return SimpleNamespace(success=False, error="update failed", message_id=self.message_id)
+
+
 class TestFeishuCardKitSendLifecycle(unittest.TestCase):
     def setUp(self):
         FakeCardSession.counter = 0
@@ -5005,6 +5011,20 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
         self.assertIn(("update", "hello world"), session.started)
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardSession)
+    def test_edit_message_success_recreates_stale_open_card_index(self):
+        adapter = self._adapter()
+        sent = asyncio.run(adapter.send("oc_chat", "hello"))
+        session = adapter._cardkit_sessions[sent.message_id]
+        adapter._cardkit_open_by_chat.pop("oc_chat", None)
+
+        result = asyncio.run(adapter.edit_message("oc_chat", sent.message_id, "hello world", finalize=False))
+
+        self.assertTrue(result.success)
+        self.assertIs(adapter._cardkit_sessions[sent.message_id], session)
+        self.assertIs(adapter._cardkit_open_by_chat["oc_chat"][sent.message_id], session)
+        self.assertIn(("update", "hello world"), session.started)
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardSession)
     def test_edit_message_finalize_closes_and_removes_card(self):
         adapter = self._adapter()
         sent = asyncio.run(adapter.send("oc_chat", "hello"))
@@ -5019,7 +5039,6 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
 
     def test_edit_message_unknown_card_uses_existing_update_path(self):
         adapter = self._adapter()
-        adapter._cardkit_client = object()
 
         response = SimpleNamespace(
             success=lambda: True,
@@ -5160,6 +5179,20 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
         self.assertEqual(session.closed_with, ["hello final"])
         self.assertIn(sent.message_id, adapter._cardkit_sessions)
         self.assertIn(sent.message_id, adapter._cardkit_open_by_chat["oc_chat"])
+
+    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingUpdateSession)
+    def test_tracked_update_failure_returns_unsuccessful_and_keeps_session(self):
+        adapter = self._adapter()
+        sent = asyncio.run(adapter.send("oc_chat", "hello"))
+        session = adapter._cardkit_sessions[sent.message_id]
+        adapter._cardkit_open_by_chat.pop("oc_chat", None)
+
+        result = asyncio.run(adapter.edit_message("oc_chat", sent.message_id, "hello more", finalize=False))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "update failed")
+        self.assertIs(adapter._cardkit_sessions[sent.message_id], session)
+        self.assertNotIn("oc_chat", adapter._cardkit_open_by_chat)
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
     def test_sibling_close_failure_does_not_block_current_send(self):
