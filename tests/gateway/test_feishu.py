@@ -5162,23 +5162,25 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
         self.assertIn(sent.message_id, adapter._cardkit_open_by_chat["oc_chat"])
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
-    def test_sibling_close_failure_keeps_previous_session_tracked(self):
+    def test_sibling_close_failure_does_not_block_current_send(self):
         adapter = self._adapter()
         first = asyncio.run(adapter.send("oc_chat", "tool progress"))
 
         second = asyncio.run(adapter.send("oc_chat", "assistant commentary"))
 
-        self.assertFalse(second.success)
-        self.assertEqual(second.error, "close failed")
+        self.assertTrue(second.success)
+        self.assertNotEqual(second.message_id, first.message_id)
         self.assertIn(first.message_id, adapter._cardkit_sessions)
         self.assertIn(first.message_id, adapter._cardkit_open_by_chat["oc_chat"])
+        self.assertIn(second.message_id, adapter._cardkit_sessions)
+        self.assertIn(second.message_id, adapter._cardkit_open_by_chat["oc_chat"])
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
-    def test_sibling_close_failure_keeps_unattempted_sessions_indexed(self):
+    def test_sibling_close_failure_keeps_unattempted_sessions_indexed_and_sends_current(self):
         adapter = self._adapter()
         first = asyncio.run(adapter.send("oc_chat", "tool progress"))
         extra = FailingCloseSession(
-            client=adapter._cardkit_client,
+            client=adapter._get_cardkit_client(),
             chat_id="oc_chat",
             send_card_reference=adapter._send_cardkit_reference,
             block_streaming=True,
@@ -5190,6 +5192,7 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
 
         result = asyncio.run(adapter.send("oc_chat", "assistant commentary"))
 
-        self.assertFalse(result.success)
+        self.assertTrue(result.success)
         self.assertIn(first.message_id, adapter._cardkit_open_by_chat["oc_chat"])
         self.assertIn(extra.message_id, adapter._cardkit_open_by_chat["oc_chat"])
+        self.assertIn(result.message_id, adapter._cardkit_open_by_chat["oc_chat"])
