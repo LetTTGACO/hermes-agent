@@ -63,12 +63,8 @@ def has_natural_streaming_boundary(text: str) -> bool:
     return bool(text) and text[-1] in _NATURAL_STREAMING_BOUNDARIES
 
 
-def should_push_streaming_update(
-    previous_text: str, next_text: str, *, block_streaming: bool
-) -> bool:
+def should_push_streaming_update(previous_text: str, next_text: str) -> bool:
     if not previous_text:
-        return True
-    if not block_streaming:
         return True
     delta_chars = max(0, len(next_text) - len(previous_text))
     return (
@@ -208,12 +204,10 @@ class FeishuStreamingCardSession:
         client: Any,
         chat_id: str,
         send_card_reference: SendCardReference,
-        block_streaming: bool = True,
     ):
         self.client = client
         self.chat_id = chat_id
         self.send_card_reference = send_card_reference
-        self.block_streaming = block_streaming
         self.card_id: Optional[str] = None
         self.message_id: Optional[str] = None
         self.sequence = 1
@@ -279,15 +273,11 @@ class FeishuStreamingCardSession:
         if not should_push_streaming_update(
             self.current_text,
             next_text,
-            block_streaming=self.block_streaming,
         ):
             self._schedule_pending_flush()
             return SendResult(success=True, message_id=self.message_id)
         now_ms = time.monotonic() * 1000
-        if (
-            self.block_streaming
-            and now_ms - self.last_update_time < STREAMING_UPDATE_THROTTLE_MS
-        ):
+        if now_ms - self.last_update_time < STREAMING_UPDATE_THROTTLE_MS:
             self._schedule_pending_flush(now_ms=now_ms)
             return SendResult(success=True, message_id=self.message_id)
         await self._push_update(next_text, force=True)
@@ -336,7 +326,7 @@ class FeishuStreamingCardSession:
         return SendResult(success=True, message_id=self.message_id)
 
     def _schedule_pending_flush(self, *, now_ms: Optional[float] = None) -> None:
-        if not self.block_streaming or self.closed or not self.pending_text:
+        if self.closed or not self.pending_text:
             return
         if self._pending_flush_task and not self._pending_flush_task.done():
             return

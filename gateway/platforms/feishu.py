@@ -1798,7 +1798,6 @@ class FeishuAdapter(BasePlatformAdapter):
             client=cardkit_client,
             chat_id=chat_id,
             send_card_reference=self._send_cardkit_reference,
-            block_streaming=True,
         )
         try:
             result = await session.start(content, reply_to=reply_to, metadata=metadata)

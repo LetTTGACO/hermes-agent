@@ -59,11 +59,10 @@ def test_has_natural_streaming_boundary_supports_ascii_and_chinese_punctuation()
 def test_should_push_streaming_update_uses_internal_boundary_and_delta_rules():
     from gateway.platforms.feishu_streaming_card import should_push_streaming_update
 
-    assert should_push_streaming_update("", "hi", block_streaming=True) is True
-    assert should_push_streaming_update("hello", "hello there", block_streaming=True) is False
-    assert should_push_streaming_update("hello", "hello there.", block_streaming=True) is True
-    assert should_push_streaming_update("a", "a" + "b" * 18, block_streaming=True) is True
-    assert should_push_streaming_update("hello", "hello there", block_streaming=False) is True
+    assert should_push_streaming_update("", "hi") is True
+    assert should_push_streaming_update("hello", "hello there") is False
+    assert should_push_streaming_update("hello", "hello there.") is True
+    assert should_push_streaming_update("a", "a" + "b" * 18) is True
 
 
 def test_strip_streaming_cursor_removes_gateway_cursor_suffix():
@@ -101,7 +100,6 @@ def test_session_start_creates_card_and_sends_reference():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=True,
     )
 
     result = asyncio.run(session.start("hello", reply_to=None, metadata=None))
@@ -123,12 +121,12 @@ def test_session_update_sends_full_snapshot_and_increments_sequence():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=False,
     )
     asyncio.run(session.start("hello", reply_to=None, metadata=None))
-    asyncio.run(session.update("hello world"))
+    session.last_update_time = 0.0
+    asyncio.run(session.update("hello world."))
 
-    assert ("update", "card_123", "content", "hello world", 3) in client.calls
+    assert ("update", "card_123", "content", "hello world.", 3) in client.calls
 
 
 def test_session_update_coalesces_small_delta_until_close():
@@ -139,7 +137,6 @@ def test_session_update_coalesces_small_delta_until_close():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=True,
     )
     asyncio.run(session.start("hello", reply_to=None, metadata=None))
     asyncio.run(session.update("hello there"))
@@ -161,7 +158,6 @@ def test_session_update_flushes_pending_small_delta_after_throttle():
             client=client,
             chat_id="oc_chat",
             send_card_reference=fake_send_card_reference,
-            block_streaming=True,
         )
         await session.start("hello", reply_to=None, metadata=None)
         await session.update("hello there")
@@ -183,7 +179,6 @@ def test_session_close_disables_streaming_mode_once():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=True,
     )
     asyncio.run(session.start("hello", reply_to=None, metadata=None))
     asyncio.run(session.close("hello final"))
@@ -210,7 +205,6 @@ def test_session_close_reports_failure_when_final_update_fails():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=True,
     )
     asyncio.run(session.start("hello", reply_to=None, metadata=None))
 
@@ -235,7 +229,6 @@ def test_session_start_closes_card_reference_when_initial_update_fails():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=True,
     )
 
     result = asyncio.run(session.start("hello", reply_to=None, metadata=None))
@@ -260,7 +253,6 @@ def test_session_close_reports_failure_when_close_card_fails():
         client=client,
         chat_id="oc_chat",
         send_card_reference=fake_send_card_reference,
-        block_streaming=True,
     )
     asyncio.run(session.start("hello", reply_to=None, metadata=None))
 

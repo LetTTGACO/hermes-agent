@@ -4891,7 +4891,7 @@ class FakeCardSession:
     counter = 0
     instances = []
 
-    def __init__(self, *, client, chat_id, send_card_reference, block_streaming):
+    def __init__(self, *, client, chat_id, send_card_reference):
         FakeCardSession.counter += 1
         FakeCardSession.instances.append(self)
         self.chat_id = chat_id
@@ -5225,7 +5225,6 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
             client=adapter._get_cardkit_client(),
             chat_id="oc_chat",
             send_card_reference=adapter._send_cardkit_reference,
-            block_streaming=True,
         )
         extra.message_id = "card_msg_extra"
         extra.current_text = "still open"
