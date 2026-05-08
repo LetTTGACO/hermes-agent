@@ -334,22 +334,8 @@ class TestStreamingPerPlatform:
         }
         assert resolve_display_setting(config, "email", "streaming") is True
 
-    def test_feishu_block_streaming_defaults_true(self):
-        """Feishu CardKit streaming batches on natural boundaries by default."""
-        from gateway.display_config import resolve_display_setting
-
-        assert resolve_display_setting({}, "feishu", "blockStreaming") is True
-
-    def test_feishu_block_streaming_platform_override_false(self):
-        """display.platforms.feishu.blockStreaming=false disables boundary batching."""
-        from gateway.display_config import resolve_display_setting
-
-        config = {"display": {"platforms": {"feishu": {"blockStreaming": False}}}}
-
-        assert resolve_display_setting(config, "feishu", "blockStreaming") is False
-
     def test_feishu_streaming_override_still_beats_global(self):
-        """display.platforms.feishu.streaming has priority over streaming.enabled."""
+        """display.platforms.feishu.streaming remains a gateway token-streaming override."""
         from gateway.display_config import resolve_display_setting
 
         config = {
