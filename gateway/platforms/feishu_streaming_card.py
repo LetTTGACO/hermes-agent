@@ -41,7 +41,7 @@ def build_streaming_card() -> Dict[str, Any]:
             "summary": {"content": "[Generating...]"},
             "streaming_config": {
                 "print_frequency_ms": {"default": 50},
-                "print_step": {"default": 1},
+                "print_step": {"default": 5},
                 "print_strategy": "fast",
             },
         },
