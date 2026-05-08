@@ -1625,9 +1625,7 @@ class FeishuAdapter(BasePlatformAdapter):
         global_enabled = bool(getattr(streaming_config, "enabled", False))
         enabled = global_enabled if plat_streaming is None else bool(plat_streaming)
         self._cardkit_streaming_enabled = bool(enabled and transport != "off")
-        self._cardkit_block_streaming = bool(
-            resolve_display_setting(user_config or {}, "feishu", "blockStreaming", True)
-        )
+        self._cardkit_block_streaming = True
         if not self._cardkit_streaming_enabled:
             self._cardkit_client = None
             self._cardkit_sessions.clear()

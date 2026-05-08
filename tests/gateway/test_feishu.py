@@ -4859,7 +4859,7 @@ class TestFeishuCardKitStreamingConfig(unittest.TestCase):
 
         self.assertFalse(adapter._cardkit_streaming_enabled)
 
-    def test_cardkit_block_streaming_defaults_true_and_can_disable(self):
+    def test_cardkit_block_streaming_defaults_true_and_ignores_legacy_display_config(self):
         from gateway.config import PlatformConfig, StreamingConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -4869,7 +4869,7 @@ class TestFeishuCardKitStreamingConfig(unittest.TestCase):
 
         user_config = {"display": {"platforms": {"feishu": {"blockStreaming": False}}}}
         adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
-        self.assertFalse(adapter._cardkit_block_streaming)
+        self.assertTrue(adapter._cardkit_block_streaming)
 
     def test_cardkit_disable_clears_runtime_state(self):
         from gateway.config import PlatformConfig, StreamingConfig
