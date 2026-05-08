@@ -5046,28 +5046,27 @@ class FailingCloseSession(FakeCardSession):
 
 
 class TestFeishuCardKitFallbacks(unittest.TestCase):
-    def _adapter(self, enabled):
+    def _adapter(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
         adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
-        if not enabled:
-            adapter._app_id = ""
-            adapter._app_secret = ""
         return adapter
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingStartSession)
     def test_cardkit_first_send_failure_returns_unsuccessful_result(self):
-        adapter = self._adapter(enabled=True)
+        adapter = self._adapter()
 
         result = asyncio.run(adapter.send("oc_chat", "hello"))
 
         self.assertFalse(result.success)
         self.assertEqual(result.error, "create card failed")
 
-    def test_cardkit_disabled_uses_existing_send_path(self):
-        adapter = self._adapter(enabled=False)
+    def test_standard_send_path_preserves_existing_text_delivery(self):
+        adapter = self._adapter()
+        adapter._client = SimpleNamespace()
+        adapter._app_id = ""
         response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="normal_msg"))
         adapter._feishu_send_with_retry = AsyncMock(return_value=response)
 

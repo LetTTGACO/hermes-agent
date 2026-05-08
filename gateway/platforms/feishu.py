@@ -1804,25 +1804,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
         return result
 
-    async def send(
+    async def _send_standard_message(
         self,
         chat_id: str,
         content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
     ) -> SendResult:
-        """Send a Feishu message."""
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-
-        if self._get_cardkit_client() is not None:
-            return await self._send_cardkit(
-                chat_id,
-                content,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
@@ -1868,6 +1857,32 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Feishu message."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        if self._get_cardkit_client() is not None:
+            return await self._send_cardkit(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+        return await self._send_standard_message(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def edit_message(
         self,
