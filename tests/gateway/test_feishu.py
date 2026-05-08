@@ -4847,6 +4847,17 @@ class TestFeishuCardKitRuntimeDefaults(unittest.TestCase):
         self.assertFalse(adapter._should_try_cardkit())
         self.assertTrue(adapter.SUPPORTS_MESSAGE_EDITING)
 
+    def test_cardkit_is_not_attemptable_when_helper_import_unavailable(self):
+        from gateway.config import PlatformConfig
+        import gateway.platforms.feishu as feishu
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
+
+        with patch.object(feishu, "FeishuCardKitClient", None):
+            self.assertFalse(adapter._should_try_cardkit())
+
     def test_display_streaming_config_does_not_disable_cardkit(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

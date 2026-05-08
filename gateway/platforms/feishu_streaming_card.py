@@ -9,23 +9,14 @@ import time
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from gateway.platforms.base import SendResult
-
-try:
-    from lark_oapi.api.cardkit.v1 import (
-        ContentCardElementRequest,
-        ContentCardElementRequestBody,
-        CreateCardRequest,
-        CreateCardRequestBody,
-        SettingsCardRequest,
-        SettingsCardRequestBody,
-    )
-except ImportError:
-    ContentCardElementRequest = None  # type: ignore[assignment]
-    ContentCardElementRequestBody = None  # type: ignore[assignment]
-    CreateCardRequest = None  # type: ignore[assignment]
-    CreateCardRequestBody = None  # type: ignore[assignment]
-    SettingsCardRequest = None  # type: ignore[assignment]
-    SettingsCardRequestBody = None  # type: ignore[assignment]
+from lark_oapi.api.cardkit.v1 import (
+    ContentCardElementRequest,
+    ContentCardElementRequestBody,
+    CreateCardRequest,
+    CreateCardRequestBody,
+    SettingsCardRequest,
+    SettingsCardRequestBody,
+)
 
 
 logger = logging.getLogger("gateway.feishu.streaming_card")
@@ -119,24 +110,6 @@ class FeishuCardKitClient:
     def __init__(self, sdk_client: Any):
         self.sdk_client = sdk_client
 
-    def _require_models(self) -> None:
-        missing = [
-            name
-            for name, value in (
-                ("CreateCardRequest", CreateCardRequest),
-                ("CreateCardRequestBody", CreateCardRequestBody),
-                ("ContentCardElementRequest", ContentCardElementRequest),
-                ("ContentCardElementRequestBody", ContentCardElementRequestBody),
-                ("SettingsCardRequest", SettingsCardRequest),
-                ("SettingsCardRequestBody", SettingsCardRequestBody),
-            )
-            if value is None
-        ]
-        if missing:
-            raise RuntimeError(
-                f"lark_oapi CardKit models unavailable: {', '.join(missing)}"
-            )
-
     @staticmethod
     def _ensure_success(response: Any, action: str) -> None:
         success = getattr(response, "success", None)
@@ -159,7 +132,6 @@ class FeishuCardKitClient:
         return self.sdk_client.cardkit.v1.card_element
 
     async def create_card(self) -> str:
-        self._require_models()
         body = (
             CreateCardRequestBody.builder()
             .type("card_json")
@@ -181,7 +153,6 @@ class FeishuCardKitClient:
         content: str,
         sequence: int,
     ) -> None:
-        self._require_models()
         if len(content) > MAX_CARD_TEXT_LENGTH:
             raise ValueError(
                 f"CardKit content exceeds {MAX_CARD_TEXT_LENGTH} characters"
@@ -204,7 +175,6 @@ class FeishuCardKitClient:
         self._ensure_success(response, "update card")
 
     async def close_card(self, card_id: str, final_text: str, sequence: int) -> None:
-        self._require_models()
         settings = {
             "config": {
                 "streaming_mode": False,

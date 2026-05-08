@@ -111,6 +111,10 @@ try:
     )
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
+    from gateway.platforms.feishu_streaming_card import (
+        FeishuCardKitClient,
+        FeishuStreamingCardSession,
+    )
 
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -122,6 +126,8 @@ except ImportError:
     FeishuWSClient = None  # type: ignore[assignment]
     FEISHU_DOMAIN = None  # type: ignore[assignment]
     LARK_DOMAIN = None  # type: ignore[assignment]
+    FeishuCardKitClient = None  # type: ignore[assignment]
+    FeishuStreamingCardSession = None  # type: ignore[assignment]
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -138,10 +144,6 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
-)
-from gateway.platforms.feishu_streaming_card import (
-    FeishuCardKitClient,
-    FeishuStreamingCardSession,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -1713,7 +1715,14 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _should_try_cardkit(self) -> bool:
-        return bool(self._app_id and self._app_secret and self._client is not None)
+        return bool(
+            FEISHU_AVAILABLE
+            and FeishuCardKitClient is not None
+            and FeishuStreamingCardSession is not None
+            and self._app_id
+            and self._app_secret
+            and self._client is not None
+        )
 
     def _get_cardkit_client(self) -> Optional[FeishuCardKitClient]:
         if not self._should_try_cardkit():
