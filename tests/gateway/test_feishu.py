@@ -4825,69 +4825,57 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         self.assertNotIn("@Hermes @Alice", event.text)
 
 
-class TestFeishuCardKitStreamingConfig(unittest.TestCase):
-    def test_cardkit_streaming_inherits_global_streaming_enabled(self):
-        from gateway.config import PlatformConfig, StreamingConfig
+class TestFeishuCardKitRuntimeDefaults(unittest.TestCase):
+    def test_cardkit_is_attemptable_with_credentials_and_connected_client(self):
+        from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        adapter.configure_cardkit_streaming({}, StreamingConfig(enabled=True, transport="edit"))
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
 
-        self.assertTrue(adapter._cardkit_streaming_enabled)
+        self.assertTrue(adapter._should_try_cardkit())
         self.assertTrue(adapter.SUPPORTS_MESSAGE_EDITING)
         self.assertTrue(adapter.REQUIRES_EDIT_FINALIZE)
 
-    def test_cardkit_streaming_platform_override_wins(self):
-        from gateway.config import PlatformConfig, StreamingConfig
+    def test_cardkit_is_not_attemptable_without_connected_client(self):
+        from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        user_config = {"display": {"platforms": {"feishu": {"streaming": False}}}}
-        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
+        adapter._client = None
 
-        self.assertFalse(adapter._cardkit_streaming_enabled)
+        self.assertFalse(adapter._should_try_cardkit())
         self.assertTrue(adapter.SUPPORTS_MESSAGE_EDITING)
-        self.assertFalse(adapter.REQUIRES_EDIT_FINALIZE)
 
-    def test_cardkit_streaming_transport_off_disables_even_with_override(self):
-        from gateway.config import PlatformConfig, StreamingConfig
+    def test_display_streaming_config_does_not_disable_cardkit(self):
+        from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        user_config = {"display": {"platforms": {"feishu": {"streaming": True}}}}
-        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="off"))
+        disabled_streaming_config = {
+            "streaming": {"enabled": False, "transport": "off"},
+            "display": {
+                "platforms": {
+                    "feishu": {
+                        "streaming": False,
+                        "blockStreaming": False,
+                    }
+                }
+            },
+        }
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "app",
+                    "app_secret": "secret",
+                    **disabled_streaming_config,
+                }
+            )
+        )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
 
-        self.assertFalse(adapter._cardkit_streaming_enabled)
-
-    def test_cardkit_block_streaming_defaults_true_and_ignores_legacy_display_config(self):
-        from gateway.config import PlatformConfig, StreamingConfig
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        adapter.configure_cardkit_streaming({}, StreamingConfig(enabled=True, transport="edit"))
-        self.assertTrue(adapter._cardkit_block_streaming)
-
-        user_config = {"display": {"platforms": {"feishu": {"blockStreaming": False}}}}
-        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
-        self.assertTrue(adapter._cardkit_block_streaming)
-
-    def test_cardkit_disable_clears_runtime_state(self):
-        from gateway.config import PlatformConfig, StreamingConfig
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        adapter.configure_cardkit_streaming({}, StreamingConfig(enabled=True, transport="edit"))
-        self.assertIsNotNone(adapter._cardkit_client)
-        adapter._cardkit_sessions["message-id"] = object()
-        adapter._cardkit_open_by_chat["chat-id"] = {"message-id": object()}
-
-        user_config = {"display": {"platforms": {"feishu": {"streaming": False}}}}
-        adapter.configure_cardkit_streaming(user_config, StreamingConfig(enabled=True, transport="edit"))
-
-        self.assertIsNone(adapter._cardkit_client)
-        self.assertEqual(adapter._cardkit_sessions, {})
-        self.assertEqual(adapter._cardkit_open_by_chat, {})
-        self.assertFalse(adapter.REQUIRES_EDIT_FINALIZE)
+        self.assertFalse(disabled_streaming_config["display"]["platforms"]["feishu"]["streaming"])
+        self.assertFalse(hasattr(adapter, "configure_cardkit_streaming"))
+        self.assertTrue(adapter._should_try_cardkit())
 
 
 class FakeCardSession:
@@ -4934,15 +4922,11 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
         FakeCardSession.instances = []
 
     def _adapter(self):
-        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        adapter._client = SimpleNamespace()
-        adapter.configure_cardkit_streaming(
-            {"display": {"platforms": {"feishu": {"streaming": True}}}},
-            StreamingConfig(enabled=False, transport="edit"),
-        )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
         return adapter
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FakeCardSession)
@@ -5029,7 +5013,6 @@ class TestFeishuCardKitSendLifecycle(unittest.TestCase):
 
     def test_edit_message_unknown_card_uses_existing_update_path(self):
         adapter = self._adapter()
-        adapter._cardkit_streaming_enabled = True
         adapter._cardkit_client = object()
 
         response = SimpleNamespace(
@@ -5064,16 +5047,14 @@ class FailingCloseSession(FakeCardSession):
 
 class TestFeishuCardKitFallbacks(unittest.TestCase):
     def _adapter(self, enabled):
-        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        adapter._client = SimpleNamespace()
-        if enabled:
-            adapter.configure_cardkit_streaming(
-                {"display": {"platforms": {"feishu": {"streaming": True}}}},
-                StreamingConfig(enabled=False, transport="edit"),
-            )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
+        if not enabled:
+            adapter._app_id = ""
+            adapter._app_secret = ""
         return adapter
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingStartSession)
@@ -5103,15 +5084,11 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
         FakeCardSession.instances = []
 
     def _adapter(self):
-        from gateway.config import PlatformConfig, StreamingConfig
+        from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"app_id": "app", "app_secret": "secret"}))
-        adapter._client = SimpleNamespace()
-        adapter.configure_cardkit_streaming(
-            {"display": {"platforms": {"feishu": {"streaming": True}}}},
-            StreamingConfig(enabled=False, transport="edit"),
-        )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
         return adapter
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
