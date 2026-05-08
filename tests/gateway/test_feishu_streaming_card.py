@@ -56,7 +56,7 @@ def test_has_natural_streaming_boundary_supports_ascii_and_chinese_punctuation()
     assert has_natural_streaming_boundary("") is False
 
 
-def test_should_push_streaming_update_uses_boundary_and_delta():
+def test_should_push_streaming_update_uses_internal_boundary_and_delta_rules():
     from gateway.platforms.feishu_streaming_card import should_push_streaming_update
 
     assert should_push_streaming_update("", "hi", block_streaming=True) is True
@@ -131,7 +131,7 @@ def test_session_update_sends_full_snapshot_and_increments_sequence():
     assert ("update", "card_123", "content", "hello world", 3) in client.calls
 
 
-def test_session_update_blocks_small_delta_until_close_when_block_streaming_true():
+def test_session_update_coalesces_small_delta_until_close():
     from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
 
     client = FakeCardKitClient()

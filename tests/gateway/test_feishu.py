@@ -4857,7 +4857,6 @@ class TestFeishuCardKitRuntimeDefaults(unittest.TestCase):
                 "platforms": {
                     "feishu": {
                         "streaming": False,
-                        "blockStreaming": False,
                     }
                 }
             },
@@ -4874,7 +4873,6 @@ class TestFeishuCardKitRuntimeDefaults(unittest.TestCase):
         adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
 
         self.assertFalse(disabled_streaming_config["display"]["platforms"]["feishu"]["streaming"])
-        self.assertFalse(hasattr(adapter, "configure_cardkit_streaming"))
         self.assertTrue(adapter._should_try_cardkit())
 
 
@@ -5209,7 +5207,7 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
         self.assertIn(second.message_id, adapter._cardkit_open_by_chat["oc_chat"])
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
-    def test_sibling_close_failure_keeps_unattempted_sessions_indexed_and_sends_current(self):
+    def test_sibling_close_failure_keeps_failed_sessions_indexed_and_sends_current(self):
         adapter = self._adapter()
         first = asyncio.run(adapter.send("oc_chat", "tool progress"))
         extra = FailingCloseSession(
