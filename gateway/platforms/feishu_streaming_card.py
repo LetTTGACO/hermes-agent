@@ -342,6 +342,11 @@ class FeishuStreamingCardSession:
                     exc,
                     exc_info=True,
                 )
+                return SendResult(
+                    success=False,
+                    message_id=self.message_id,
+                    error=str(exc),
+                )
         self.sequence += 1
         try:
             await self.client.close_card(

@@ -142,7 +142,6 @@ from gateway.platforms.base import (
 from gateway.platforms.feishu_streaming_card import (
     FeishuCardKitClient,
     FeishuStreamingCardSession,
-    resolve_receive_id_type,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home

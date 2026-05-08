@@ -193,7 +193,7 @@ def test_session_close_disables_streaming_mode_once():
     assert close_calls == [("close", "card_123", "hello final", 4)]
 
 
-def test_session_close_attempts_close_card_when_final_update_fails():
+def test_session_close_reports_failure_when_final_update_fails():
     from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
 
     class FailingFinalUpdateClient(FakeCardKitClient):
@@ -216,9 +216,10 @@ def test_session_close_attempts_close_card_when_final_update_fails():
 
     result = asyncio.run(session.close("hello final"))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.error == "update failed"
     assert ("update_failed", "card_123", "content", "hello final", 3) in client.calls
-    assert ("close", "card_123", "hello final", 4) in client.calls
+    assert not any(call[0] == "close" for call in client.calls)
 
 
 def test_session_start_closes_card_reference_when_initial_update_fails():
