@@ -149,6 +149,10 @@ class FeishuCardKitClient:
         content: str,
         sequence: int,
     ) -> None:
+        # Do not silently truncate CardKit content.  If the full snapshot is
+        # too large for CardKit, fail setup/update explicitly so the Feishu
+        # adapter can fall back to the standard chunking send path when this is
+        # still a send setup failure.
         if len(content) > MAX_CARD_TEXT_LENGTH:
             raise ValueError(
                 f"CardKit content exceeds {MAX_CARD_TEXT_LENGTH} characters"
@@ -263,6 +267,9 @@ class FeishuStreamingCardSession:
     async def update(self, text: str) -> SendResult:
         if self.closed or not self.card_id or not self.message_id:
             return SendResult(success=False, error="CardKit session is not active")
+        # CardKit receives full visible markdown snapshots, not deltas.  The
+        # merge step protects continuity across gateway cursor stripping,
+        # throttled updates, and providers that resend overlapping text.
         next_text = merge_streaming_text(
             self.pending_text or self.current_text,
             strip_streaming_cursor(text),

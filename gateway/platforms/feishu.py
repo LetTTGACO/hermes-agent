@@ -1586,6 +1586,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @property
     def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
+        # CardKit cards have a native streaming lifecycle.  The stream
+        # consumer must send the final finalize=True edit even when the final
+        # text matches the last visible snapshot, otherwise the card can stay
+        # in its in-progress rendering state.  Keep this dynamic so the
+        # standard Feishu edit path does not force redundant final edits when
+        # CardKit is unavailable.
         return self._should_try_cardkit() or bool(self._cardkit_sessions)
 
     async def connect(self) -> bool:
@@ -1715,6 +1721,11 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _should_try_cardkit(self) -> bool:
+        # CardKit textual sends are default-first and are intentionally based
+        # on adapter runtime capability only: credentials, optional dependency
+        # import, and a connected lark_oapi client.  Gateway streaming config
+        # controls token streaming, not whether one-shot Feishu sends can use
+        # CardKit.
         return bool(
             FEISHU_AVAILABLE
             and FeishuCardKitClient is not None
@@ -1755,6 +1766,10 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def _close_cardkit_siblings(self, chat_id: str) -> None:
+        # There is no gateway-level "turn is definitely done with all interim
+        # bubbles" signal.  Following the DingTalk AI Card pattern, every new
+        # CardKit send best-effort closes older open cards in the same chat so
+        # tool-progress/commentary cards do not remain visibly generating.
         sessions = dict(self._cardkit_open_by_chat.get(chat_id) or {})
         if not sessions:
             return
@@ -1808,6 +1823,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return result
         if not hasattr(session, "current_text"):
             setattr(session, "current_text", content)
+        # Match DingTalk's gateway contract:
+        # - reply_to is set by the base adapter path for final replies to an
+        #   inbound user message, so close the CardKit stream immediately.
+        # - reply_to is absent for stream first chunks, tool progress, and
+        #   interim commentary, so keep the card open for edit_message() or
+        #   sibling cleanup.
         if reply_to is not None:
             try:
                 close_result = await session.close(content)
@@ -1896,6 +1917,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        # Textual Feishu delivery is CardKit-first by default.  Setup failures
+        # are deliberately handled here, at the platform boundary, by falling
+        # back once to the original text/post implementation.  Edit failures
+        # for already-tracked CardKit messages are handled in edit_message()
+        # instead so GatewayStreamConsumer can use its existing continuation
+        # fallback.
         if self._should_try_cardkit():
             cardkit_result = await self._send_cardkit(
                 chat_id,
@@ -1931,6 +1958,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
         session = self._cardkit_sessions.get(message_id)
         if session is not None:
+            # Tracked message IDs are native CardKit sessions.  Do not perform
+            # an adapter-local standard-message fallback here: returning an
+            # unsuccessful SendResult lets GatewayStreamConsumer decide whether
+            # to retry, continue, or send only the missing final tail.
             try:
                 if finalize:
                     result = await session.close(content)
@@ -1950,6 +1981,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] CardKit edit failed for %s: %s", message_id, exc, exc_info=True)
                 return SendResult(success=False, error=str(exc), message_id=message_id)
 
+        # Unknown message IDs are ordinary Feishu text/post messages (or
+        # CardKit setup-fallback sends).  Preserve the historical
+        # im.v1.message.update path for those so CardKit does not change
+        # standard Feishu editing behavior.
         content = self.format_message(content)
         try:
             msg_type, payload = self._build_outbound_payload(content)
