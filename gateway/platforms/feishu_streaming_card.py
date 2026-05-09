@@ -29,10 +29,6 @@ MAX_CARD_TEXT_LENGTH = 30000
 _NATURAL_STREAMING_BOUNDARIES = "\n.!?;:。！？；："
 
 
-def resolve_receive_id_type(chat_id: str) -> str:
-    return "open_id" if chat_id.startswith("ou_") else "chat_id"
-
-
 def build_streaming_card() -> Dict[str, Any]:
     return {
         "schema": "2.0",

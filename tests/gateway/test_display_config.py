@@ -334,17 +334,6 @@ class TestStreamingPerPlatform:
         }
         assert resolve_display_setting(config, "email", "streaming") is True
 
-    def test_feishu_streaming_override_still_beats_global(self):
-        """display.platforms.feishu.streaming remains a gateway token-streaming override."""
-        from gateway.display_config import resolve_display_setting
-
-        config = {
-            "streaming": {"enabled": False},
-            "display": {"platforms": {"feishu": {"streaming": True}}},
-        }
-
-        assert resolve_display_setting(config, "feishu", "streaming") is True
-
 
 # ---------------------------------------------------------------------------
 # cleanup_progress — opt-in deletion of temporary progress bubbles

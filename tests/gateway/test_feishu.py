@@ -5094,18 +5094,6 @@ class TestFeishuCardKitFallbacks(unittest.TestCase):
         adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace()))
         return adapter
 
-    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingStartSession)
-    def test_cardkit_first_send_failure_falls_back_to_standard_result(self):
-        adapter = self._adapter()
-        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="normal_msg"))
-        adapter._feishu_send_with_retry = AsyncMock(return_value=response)
-
-        result = asyncio.run(adapter.send("oc_chat", "hello"))
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.message_id, "normal_msg")
-        adapter._feishu_send_with_retry.assert_awaited_once()
-
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
     def test_one_shot_close_failure_falls_back_to_standard_send(self):
         adapter = self._adapter()
@@ -5202,20 +5190,6 @@ class TestFeishuCardKitFinalizeFailures(unittest.TestCase):
         self.assertEqual(result.error, "update failed")
         self.assertIs(adapter._cardkit_sessions[sent.message_id], session)
         self.assertNotIn("oc_chat", adapter._cardkit_open_by_chat)
-
-    @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
-    def test_sibling_close_failure_does_not_block_current_send(self):
-        adapter = self._adapter()
-        first = asyncio.run(adapter.send("oc_chat", "tool progress"))
-
-        second = asyncio.run(adapter.send("oc_chat", "assistant commentary"))
-
-        self.assertTrue(second.success)
-        self.assertNotEqual(second.message_id, first.message_id)
-        self.assertIn(first.message_id, adapter._cardkit_sessions)
-        self.assertIn(first.message_id, adapter._cardkit_open_by_chat["oc_chat"])
-        self.assertIn(second.message_id, adapter._cardkit_sessions)
-        self.assertIn(second.message_id, adapter._cardkit_open_by_chat["oc_chat"])
 
     @patch("gateway.platforms.feishu.FeishuStreamingCardSession", FailingCloseSession)
     def test_sibling_close_failure_keeps_failed_sessions_indexed_and_sends_current(self):

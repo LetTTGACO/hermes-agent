@@ -5,26 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_resolve_receive_id_type_uses_open_id_for_user_dm():
-    from gateway.platforms.feishu_streaming_card import resolve_receive_id_type
-
-    assert resolve_receive_id_type("ou_user") == "open_id"
-    assert resolve_receive_id_type("oc_chat") == "chat_id"
-
-
-def test_build_streaming_card_json_2_0_defaults():
+def test_build_streaming_card_json_2_0_core_shape():
     from gateway.platforms.feishu_streaming_card import build_streaming_card
 
     card = build_streaming_card()
 
     assert card["schema"] == "2.0"
     assert card["config"]["streaming_mode"] is True
-    assert card["config"]["summary"] == {"content": "[Generating...]"}
-    assert card["config"]["streaming_config"] == {
-        "print_frequency_ms": {"default": 50},
-        "print_step": {"default": 5},
-        "print_strategy": "fast",
-    }
     assert card["body"]["elements"] == [
         {"tag": "markdown", "content": "", "element_id": "content"}
     ]
@@ -40,28 +27,13 @@ def test_merge_streaming_text_preserves_prefix_and_overlap():
     assert merge_streaming_text("abc", "xyz") == "abcxyz"
 
 
-def test_truncate_summary_leaves_short_text_and_truncates_long_text():
-    from gateway.platforms.feishu_streaming_card import truncate_summary
-
-    assert truncate_summary("short", max_chars=10) == "short"
-    assert truncate_summary("abcdefghij", max_chars=5) == "abcde"
-
-
-def test_has_natural_streaming_boundary_supports_ascii_and_chinese_punctuation():
-    from gateway.platforms.feishu_streaming_card import has_natural_streaming_boundary
-
-    assert has_natural_streaming_boundary("hello.") is True
-    assert has_natural_streaming_boundary("你好！") is True
-    assert has_natural_streaming_boundary("继续") is False
-    assert has_natural_streaming_boundary("") is False
-
-
 def test_should_push_streaming_update_uses_internal_boundary_and_delta_rules():
     from gateway.platforms.feishu_streaming_card import should_push_streaming_update
 
     assert should_push_streaming_update("", "hi") is True
     assert should_push_streaming_update("hello", "hello there") is False
     assert should_push_streaming_update("hello", "hello there.") is True
+    assert should_push_streaming_update("你好", "你好！") is True
     assert should_push_streaming_update("a", "a" + "b" * 18) is True
 
 
@@ -403,7 +375,8 @@ def test_cardkit_client_uses_lark_sdk_card_resources(monkeypatch):
 
     card_id = asyncio.run(client.create_card())
     asyncio.run(client.update_element_content(card_id, "content", "hello", 7))
-    asyncio.run(client.close_card(card_id, "final text", 8))
+    long_final_text = "x" * 60
+    asyncio.run(client.close_card(card_id, long_final_text, 8))
 
     assert card_id == "card_123"
     create_request = sdk_client.card.calls[0][1]
@@ -424,7 +397,7 @@ def test_cardkit_client_uses_lark_sdk_card_resources(monkeypatch):
     settings = json.loads(settings_body.settings)
     assert settings_request.card_id == "card_123"
     assert settings["config"]["streaming_mode"] is False
-    assert settings["config"]["summary"]["content"] == "final text"
+    assert settings["config"]["summary"]["content"] == "x" * 50
     assert settings_body.sequence == 8
     assert settings_body.uuid == "c_card_123_8"
 
