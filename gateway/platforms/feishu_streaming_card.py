@@ -327,7 +327,6 @@ class FeishuStreamingCardSession:
                     "[Feishu] CardKit initial update failed for %s: %s",
                     self.card_id,
                     exc,
-                    exc_info=True,
                 )
                 await self.close(None)
                 return SendResult(
@@ -385,7 +384,6 @@ class FeishuStreamingCardSession:
                     "[Feishu] CardKit final update failed for %s: %s",
                     self.card_id,
                     exc,
-                    exc_info=True,
                 )
                 return SendResult(
                     success=False,
@@ -404,7 +402,6 @@ class FeishuStreamingCardSession:
                 "[Feishu] CardKit close failed for %s: %s",
                 self.card_id,
                 exc,
-                exc_info=True,
             )
             return SendResult(success=False, message_id=self.message_id, error=str(exc))
         self.closed = True
@@ -446,7 +443,6 @@ class FeishuStreamingCardSession:
                 "[Feishu] CardKit pending flush failed for %s: %s",
                 self.card_id,
                 exc,
-                exc_info=True,
             )
         finally:
             task = asyncio.current_task()

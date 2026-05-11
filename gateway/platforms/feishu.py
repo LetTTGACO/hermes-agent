@@ -1771,7 +1771,7 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             return self._finalize_send_result(response, "card send failed")
         except Exception as exc:
-            logger.warning("[Feishu] CardKit reference send failed: %s", exc, exc_info=True)
+            logger.warning("[Feishu] CardKit reference send failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
     async def _close_cardkit_siblings(self, chat_id: str) -> None:
@@ -1831,7 +1831,7 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             await self._close_cardkit_siblings(chat_id)
         except Exception as exc:
-            logger.warning("[Feishu] CardKit sibling close failed before static send: %s", exc, exc_info=True)
+            logger.warning("[Feishu] CardKit sibling close failed before static send: %s", exc)
         # Static CardKit messages are one-shot final surfaces.  They preserve
         # CardKit rendering without entering _cardkit_sessions, so later
         # edit_message calls still mean "standard Feishu edit" unless the
@@ -1861,7 +1861,7 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             await self._close_cardkit_siblings(chat_id)
         except Exception as exc:
-            logger.warning("[Feishu] CardKit sibling close failed before send: %s", exc, exc_info=True)
+            logger.warning("[Feishu] CardKit sibling close failed before send: %s", exc)
         session = FeishuStreamingCardSession(
             client=cardkit_client,
             chat_id=chat_id,
@@ -1871,7 +1871,7 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             result = await session.start(content, reply_to=reply_to, metadata=metadata)
         except Exception as exc:
-            logger.warning("[Feishu] CardKit send failed during start: %s", exc, exc_info=True)
+            logger.warning("[Feishu] CardKit send failed during start: %s", exc)
             return SendResult(success=False, error=str(exc))
         if not result.success or not result.message_id:
             return result
@@ -1915,7 +1915,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
         except Exception as exc:
-            logger.warning("[Feishu] CardKit send failed during setup: %s", exc, exc_info=True)
+            logger.warning("[Feishu] CardKit send failed during setup: %s", exc)
             return SendResult(success=False, error=str(exc))
 
     async def _send_standard_message(
@@ -2044,7 +2044,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
                 return result
             except Exception as exc:
-                logger.warning("[Feishu] CardKit edit failed for %s: %s", message_id, exc, exc_info=True)
+                logger.warning("[Feishu] CardKit edit failed for %s: %s", message_id, exc)
                 return SendResult(success=False, error=str(exc), message_id=message_id)
 
         # Unknown message IDs are ordinary Feishu text/post messages (or
