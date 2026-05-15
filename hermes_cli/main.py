@@ -1452,6 +1452,17 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
+def cmd_proxy(args):
+    """Local OpenAI-compatible proxy to OAuth providers."""
+    # Lazy import — pulls in aiohttp, which is gated behind an extras install
+    # for users who don't run the proxy or the messaging gateway.
+    from hermes_cli.proxy.cli import cmd_proxy as _cmd_proxy
+
+    rc = _cmd_proxy(args)
+    if isinstance(rc, int) and rc != 0:
+        raise SystemExit(rc)
+
+
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
@@ -2414,30 +2425,31 @@ def _prompt_provider_choice(choices, *, default=0):
 def _model_flow_openrouter(config, current_model=""):
     """OpenRouter provider: ensure API key, then pick model."""
     from hermes_cli.auth import (
+        ProviderConfig,
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value
 
-    api_key = get_env_value("OPENROUTER_API_KEY")
-    if not api_key:
-        print("No OpenRouter API key configured.")
+    # Route through _prompt_api_key so users can replace a stale/broken key
+    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand. The
+    # previous bypass-when-key-exists branch left no way to recover from a
+    # bad paste short of re-running `hermes setup` from scratch. OpenRouter
+    # isn't in PROVIDER_REGISTRY so we synthesize a minimal pconfig.
+    pconfig = ProviderConfig(
+        id="openrouter",
+        name="OpenRouter",
+        auth_type="api_key",
+        api_key_env_vars=("OPENROUTER_API_KEY",),
+    )
+    existing_key = get_env_value("OPENROUTER_API_KEY") or ""
+    if not existing_key:
         print("Get one at: https://openrouter.ai/keys")
         print()
-        try:
-            import getpass
-
-            key = getpass.getpass("OpenRouter API key (or Enter to cancel): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not key:
-            print("Cancelled.")
-            return
-        save_env_value("OPENROUTER_API_KEY", key)
-        print("API key saved.")
-        print()
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="openrouter")
+    if abort:
+        return
 
     from hermes_cli.models import model_ids, get_pricing_for_provider
 
@@ -2473,33 +2485,26 @@ def _model_flow_openrouter(config, current_model=""):
 def _model_flow_ai_gateway(config, current_model=""):
     """Vercel AI Gateway provider: ensure API key, then pick model with pricing."""
     from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value
 
-    api_key = get_env_value("AI_GATEWAY_API_KEY")
-    if not api_key:
-        print("No Vercel AI Gateway API key configured.")
+    # Route through _prompt_api_key so users can replace a stale/broken key
+    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand.
+    pconfig = PROVIDER_REGISTRY["ai-gateway"]
+    existing_key = get_env_value("AI_GATEWAY_API_KEY") or ""
+    if not existing_key:
         print(
             "Create API key here: https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway&title=AI+Gateway"
         )
         print("Add a payment method to get $5 in free credits.")
         print()
-        try:
-            import getpass
-
-            key = getpass.getpass("AI Gateway API key (or Enter to cancel): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not key:
-            print("Cancelled.")
-            return
-        save_env_value("AI_GATEWAY_API_KEY", key)
-        print("API key saved.")
-        print()
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="ai-gateway")
+    if abort:
+        return
 
     from hermes_cli.models import ai_gateway_model_ids, get_pricing_for_provider
 
@@ -2589,6 +2594,8 @@ def _model_flow_nous(config, current_model="", args=None):
         get_pricing_for_provider,
         check_nous_free_tier,
         partition_nous_models_by_tier,
+        union_with_portal_free_recommendations,
+        union_with_portal_paid_recommendations,
     )
 
     model_ids = get_curated_nous_model_ids()
@@ -2629,19 +2636,8 @@ def _model_flow_nous(config, current_model="", args=None):
     # Check if user is on free tier
     free_tier = check_nous_free_tier()
 
-    # For free users: partition models into selectable/unavailable based on
-    # whether they are free per the Portal-reported pricing.
-    unavailable_models: list[str] = []
-    if free_tier:
-        model_ids, unavailable_models = partition_nous_models_by_tier(
-            model_ids, pricing, free_tier=True
-        )
-
-    if not model_ids and not unavailable_models:
-        print("No models available for Nous Portal after filtering.")
-        return
-
-    # Resolve portal URL for upgrade links (may differ on staging)
+    # Resolve portal URL early — needed both for upgrade links and for the
+    # freeRecommendedModels endpoint below.
     _nous_portal_url = ""
     try:
         _nous_state = get_provider_auth_state("nous")
@@ -2649,6 +2645,32 @@ def _model_flow_nous(config, current_model="", args=None):
             _nous_portal_url = _nous_state.get("portal_base_url", "")
     except Exception:
         pass
+
+    # For free users: partition models into selectable/unavailable based on
+    # whether they are free per the Portal-reported pricing.  First augment
+    # with the Portal's freeRecommendedModels list so newly-launched free
+    # models show up even if this CLI build's hardcoded curated list and
+    # docs-hosted manifest haven't caught up yet.
+    #
+    # For paid users: mirror the same idea with paidRecommendedModels so
+    # newly-launched paid models surface in the picker too — independent
+    # of CLI release cadence.
+    unavailable_models: list[str] = []
+    if free_tier:
+        model_ids, pricing = union_with_portal_free_recommendations(
+            model_ids, pricing, _nous_portal_url,
+        )
+        model_ids, unavailable_models = partition_nous_models_by_tier(
+            model_ids, pricing, free_tier=True
+        )
+    else:
+        model_ids, pricing = union_with_portal_paid_recommendations(
+            model_ids, pricing, _nous_portal_url,
+        )
+
+    if not model_ids and not unavailable_models:
+        print("No models available for Nous Portal after filtering.")
+        return
 
     if free_tier and not model_ids:
         print("No free models currently available.")
@@ -3062,6 +3084,21 @@ def _model_flow_custom(config):
             else:
                 print(f"  If /v1 should not be in the base URL, try: {suggested}")
 
+    # Prompt for API compatibility mode explicitly so codex-compatible custom
+    # providers don't silently fall back to chat_completions.
+    current_model_cfg = config.get("model")
+    current_api_mode = ""
+    if isinstance(current_model_cfg, dict):
+        current_api_mode = str(current_model_cfg.get("api_mode") or "").strip()
+    api_mode = _prompt_custom_api_mode_selection(
+        effective_url,
+        current_api_mode=current_api_mode,
+    )
+    if api_mode:
+        print(f"  API mode: {api_mode}")
+    else:
+        print("  API mode: auto-detect")
+
     # Select model — use probe results when available, fall back to manual input
     model_name = ""
     detected_models = probe.get("models") or []
@@ -3125,7 +3162,10 @@ def _model_flow_custom(config):
         model["base_url"] = effective_url
         if effective_key:
             model["api_key"] = effective_key
-        model.pop("api_mode", None)  # let runtime auto-detect from URL
+        if api_mode:
+            model["api_mode"] = api_mode
+        else:
+            model.pop("api_mode", None)
         save_config(cfg)
         deactivate_provider()
 
@@ -3148,7 +3188,10 @@ def _model_flow_custom(config):
         _caller_model["base_url"] = effective_url
         if effective_key:
             _caller_model["api_key"] = effective_key
-        _caller_model.pop("api_mode", None)
+        if api_mode:
+            _caller_model["api_mode"] = api_mode
+        else:
+            _caller_model.pop("api_mode", None)
         config["model"] = _caller_model
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
@@ -3159,7 +3202,78 @@ def _model_flow_custom(config):
         model_name or "",
         context_length=context_length,
         name=display_name,
+        api_mode=api_mode,
     )
+
+
+def _prompt_custom_api_mode_selection(base_url: str, current_api_mode: str = "") -> Optional[str]:
+    """Prompt for a custom provider API mode.
+
+    Returns an explicit mode string, or None to keep auto-detect behavior.
+    """
+    from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+    detected_mode = _detect_api_mode_for_url(base_url)
+    normalized_current = str(current_api_mode or "").strip().lower()
+    default_mode = normalized_current or detected_mode or ""
+
+    mode_options = [
+        (
+            "",
+            "Auto-detect",
+            "Use Hermes URL heuristics; best for standard OpenAI-compatible endpoints.",
+        ),
+        (
+            "chat_completions",
+            "Chat Completions",
+            "Use /chat/completions for standard OpenAI-compatible servers.",
+        ),
+        (
+            "codex_responses",
+            "Responses / Codex",
+            "Use /responses for Codex-compatible tool-calling backends.",
+        ),
+        (
+            "anthropic_messages",
+            "Anthropic Messages",
+            "Use /v1/messages for Anthropic-compatible endpoints.",
+        ),
+    ]
+
+    print()
+    print("Select API compatibility mode:")
+    for idx, (value, label, description) in enumerate(mode_options, 1):
+        markers = []
+        if value == detected_mode:
+            markers.append("detected")
+        if value == default_mode:
+            markers.append("current")
+        suffix = f" [{' / '.join(markers)}]" if markers else ""
+        print(f"  {idx}. {label}{suffix}")
+        print(f"     {description}")
+
+    try:
+        raw = input(
+            "Choice [1-4, Enter to keep current/detected]: "
+        ).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        raise
+
+    if not raw:
+        return default_mode or None
+
+    if raw in {"1", "auto", "detect", "auto-detect"}:
+        return None
+    if raw in {"2", "chat", "chat_completions", "completions"}:
+        return "chat_completions"
+    if raw in {"3", "responses", "codex", "codex_responses"}:
+        return "codex_responses"
+    if raw in {"4", "anthropic", "anthropic_messages", "messages"}:
+        return "anthropic_messages"
+
+    print(f"Invalid API mode choice: {raw}. Falling back to auto-detect.")
+    return None
 
 
 def _auto_provider_name(base_url: str) -> str:
@@ -3197,12 +3311,12 @@ def _custom_provider_api_key_config_value(provider_info, resolved_api_key=""):
 
 
 def _save_custom_provider(
-    base_url, api_key="", model="", context_length=None, name=None
+    base_url, api_key="", model="", context_length=None, name=None, api_mode=None
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
     Deduplicates by base_url — if the URL already exists, updates the
-    model name and context_length but doesn't add a duplicate entry.
+    model name, context_length, and api_mode but doesn't add a duplicate entry.
     Uses *name* when provided, otherwise auto-generates from the URL.
     """
     from hermes_cli.config import load_config, save_config
@@ -3228,6 +3342,13 @@ def _save_custom_provider(
                 models_cfg[model] = {"context_length": context_length}
                 entry["models"] = models_cfg
                 changed = True
+            if api_mode:
+                if entry.get("api_mode") != api_mode:
+                    entry["api_mode"] = api_mode
+                    changed = True
+            elif "api_mode" in entry:
+                entry.pop("api_mode", None)
+                changed = True
             if changed:
                 cfg["custom_providers"] = providers
                 save_config(cfg)
@@ -3242,6 +3363,8 @@ def _save_custom_provider(
         entry["api_key"] = api_key
     if model:
         entry["model"] = model
+    if api_mode:
+        entry["api_mode"] = api_mode
     if model and context_length:
         entry["models"] = {model: {"context_length": context_length}}
 
@@ -3695,7 +3818,7 @@ def _model_flow_named_custom(config, provider_info):
                 save_config(cfg)
     else:
         # Save model name to the custom_providers entry for next time
-        _save_custom_provider(base_url, config_api_key, model_name)
+        _save_custom_provider(base_url, config_api_key, model_name, api_mode=api_mode)
 
     print(f"\n✅ Model set to: {model_name}")
     print(f"   Provider: {name} ({base_url})")
@@ -4852,6 +4975,37 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         )
         if model_list:
             print(f"  Found {len(model_list)} model(s) from Ollama Cloud")
+    elif provider_id == "novita":
+        from hermes_cli.models import fetch_api_models
+
+        api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
+        curated = _PROVIDER_MODELS.get(provider_id, [])
+        live_models = fetch_api_models(api_key_for_probe, effective_base)
+        if live_models:
+            model_list = live_models
+            print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
+        else:
+            mdev_models: list = []
+            try:
+                from agent.models_dev import list_agentic_models
+
+                mdev_models = list_agentic_models(provider_id)
+            except Exception:
+                pass
+            if mdev_models:
+                seen = {m.lower() for m in mdev_models}
+                model_list = list(mdev_models)
+                for m in curated:
+                    if m.lower() not in seen:
+                        model_list.append(m)
+                        seen.add(m.lower())
+                print(f"  Found {len(model_list)} model(s) from models.dev registry")
+            else:
+                model_list = curated
+                if model_list:
+                    print(
+                        f'  Showing {len(model_list)} curated models — use "Enter custom model name" for others.'
+                    )
     else:
         curated = _PROVIDER_MODELS.get(provider_id, [])
 
@@ -5527,21 +5681,50 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     if not _web_ui_build_needed(web_dir):
         return True
 
+    # Console-encoding-safe print: Windows consoles default to cp1252
+    # (or similar) and will raise UnicodeEncodeError on arrow / check
+    # glyphs unless PYTHONIOENCODING=utf-8 is set. Routing every print
+    # in this function through _say() with errors="replace" keeps the
+    # build path usable on a stock `py -m hermes_cli.main web` invocation.
+    def _say(text: str) -> None:
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+
     npm = shutil.which("npm")
     if not npm:
         if fatal:
-            print("Web UI frontend not built and npm is not available.")
-            print("Install Node.js, then run:  cd web && npm install && npm run build")
+            _say("Web UI frontend not built and npm is not available.")
+            _say("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
-    print("→ Building web UI...")
+    _say("→ Building web UI...")
+
+    def _relay(result: "subprocess.CompletedProcess") -> None:
+        """Print captured npm output so users can see *why* a step failed.
+
+        Windows users hitting `rm -rf` / `cp -r` errors (or any other
+        sync-assets / Vite failure) would otherwise see only ``Web UI
+        build failed`` with no hint of the underlying cause, because
+        the npm calls run with ``capture_output=True``.
+        """
+        for blob in (result.stdout, result.stderr):
+            if not blob:
+                continue
+            text = blob.decode("utf-8", errors="replace").rstrip() if isinstance(blob, bytes) else blob.rstrip()
+            if text:
+                _say(text)
+
     r1 = _run_npm_install_deterministic(npm, web_dir, extra_args=("--silent",))
     if r1.returncode != 0:
-        print(
+        _say(
             f"  {'✗' if fatal else '⚠'} Web UI npm install failed"
             + ("" if fatal else " (hermes web will not be available)")
         )
+        _relay(r1)
         if fatal:
-            print("  Run manually:  cd web && npm install && npm run build")
+            _say("  Run manually:  cd web && npm install && npm run build")
         return False
     # First attempt
     r2 = subprocess.run(
@@ -5576,21 +5759,20 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         # A stale UI is far better than no UI for non-interactive callers
         # (Windows Scheduled Tasks, CI) — issue #23817.
         if dist_index.exists():
-            print("  ⚠ Web UI build failed — serving stale dist as fallback")
+            _say("  ⚠ Web UI build failed — serving stale dist as fallback")
             if stderr_tail:
-                print(f"  Build error:\n  {stderr_tail}")
+                _say(f"  Build error:\n  {stderr_tail}")
             return True
 
-        print(
+        _say(
             f"  {'✗' if fatal else '⚠'} Web UI build failed"
             + ("" if fatal else " (hermes web will not be available)")
         )
-        if stderr_tail:
-            print(f"  Build error:\n  {stderr_tail}")
+        _relay(r2)
         if fatal:
-            print("  Run manually:  cd web && npm install && npm run build")
+            _say("  Run manually:  cd web && npm install && npm run build")
         return False
-    print("  ✓ Web UI built")
+    _say("  ✓ Web UI built")
     return True
 
 
@@ -6684,6 +6866,74 @@ def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
         pass
 
 
+def _refresh_active_lazy_features() -> None:
+    """Refresh lazy-installed backends after a code update.
+
+    When pyproject.toml's ``[all]`` extra was slimmed down (May 2026), most
+    optional backends moved to ``tools/lazy_deps.py`` and only install on
+    first use. ``hermes update`` runs ``uv pip install -e .[all]`` which
+    leaves those packages untouched — so if we bump a pin in
+    :data:`LAZY_DEPS` (CVE response, transitive bug fix), users who already
+    activated the backend keep the stale version forever.
+
+    This function asks lazy_deps which features the user has previously
+    activated and reinstalls them under the current pins. Features the
+    user never enabled stay quiet — no churn for cold backends.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from tools import lazy_deps
+    except Exception as exc:
+        logger.debug("Lazy refresh skipped (import failed): %s", exc)
+        return
+
+    try:
+        active = lazy_deps.active_features()
+    except Exception as exc:
+        logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
+        return
+
+    if not active:
+        return
+
+    print()
+    print(f"→ Refreshing {len(active)} active lazy backend(s)...")
+
+    try:
+        results = lazy_deps.refresh_active_features(prompt=False)
+    except Exception as exc:
+        # refresh_active_features is documented as never-raise, but defend
+        # the update flow against future regressions.
+        print(f"  ⚠ Lazy refresh failed unexpectedly: {exc}")
+        return
+
+    refreshed = [f for f, s in results.items() if s == "refreshed"]
+    current = [f for f, s in results.items() if s == "current"]
+    failed = [(f, s) for f, s in results.items() if s.startswith("failed:")]
+    skipped = [(f, s) for f, s in results.items() if s.startswith("skipped:")]
+
+    if refreshed:
+        print(f"  ↑ {len(refreshed)} refreshed: {', '.join(refreshed)}")
+    if current:
+        print(f"  ✓ {len(current)} already current")
+    if skipped:
+        # Most common reason: security.allow_lazy_installs=false. Show one
+        # line so the user knows why; not an error.
+        names = ", ".join(f for f, _ in skipped)
+        reason = skipped[0][1].split(": ", 1)[-1]
+        print(f"  · {len(skipped)} skipped ({reason}): {names}")
+    if failed:
+        for feature, status in failed:
+            reason = status.split(": ", 1)[-1]
+            # Clip noisy pip stderr to keep update output legible.
+            if len(reason) > 200:
+                reason = reason[:200] + "..."
+            print(f"  ⚠ {feature} failed to refresh: {reason}")
+        print("  Backends keep their previously-installed version; rerun")
+        print("  `hermes update` once the upstream issue is resolved.")
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -7606,6 +7856,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _install_psutil_android_compat(pip_cmd)
             _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
 
+        _refresh_active_lazy_features()
+
         _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
 
@@ -7800,6 +8052,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _ensure_fhs_path_guard()
         except Exception as e:
             logger.debug("FHS PATH guard check failed: %s", e)
+
+        # Refresh the cua-driver binary used by the Computer Use toolset.
+        # The upstream installer is gated on macOS and on the binary already
+        # being on PATH, so this is a no-op for users who don't have it.
+        # Tying the refresh to ``hermes update`` gives users a predictable
+        # cadence (matches when they pull new agent code) without adding
+        # startup latency or a per-launch GitHub API call.
+        try:
+            if sys.platform == "darwin" and shutil.which("cua-driver"):
+                from hermes_cli.tools_config import install_cua_driver
+
+                print()
+                print("→ Refreshing cua-driver (Computer Use)...")
+                install_cua_driver(upgrade=True)
+        except Exception as e:
+            logger.debug("cua-driver refresh failed: %s", e)
 
         # Write exit code *before* the gateway restart attempt.
         # When running as ``hermes update --gateway`` (spawned by the gateway's
@@ -9135,7 +9403,7 @@ def _build_provider_choices() -> list[str]:
             "auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot",
             "anthropic", "gemini", "google-gemini-cli", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
-            "stepfun", "minimax", "minimax-cn", "kilocode", "xiaomi", "arcee",
+            "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
         ]
 
@@ -9155,10 +9423,10 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "kanban", "login", "logout", "logs", "mcp", "memory", "model",
-        "pairing", "plugins", "profile", "sessions", "setup", "skills",
-        "slack", "status", "tools", "uninstall", "update", "version",
-        "webhook", "whatsapp", "chat",
+        "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
+        "model", "pairing", "plugins", "profile", "proxy", "sessions", "setup",
+        "skills", "slack", "status", "tools", "uninstall", "update",
+        "version", "webhook", "whatsapp", "chat",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -9357,7 +9625,7 @@ def main():
     gateway_parser = subparsers.add_parser(
         "gateway",
         help="Messaging gateway management",
-        description="Manage the messaging gateway (Telegram, Discord, WhatsApp)",
+        description="Manage the messaging gateway (Telegram, Discord, WhatsApp, Weixin, and more)",
     )
     gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command")
 
@@ -9498,7 +9766,63 @@ def main():
         help="Skip the confirmation prompt",
     )
 
+    # =========================================================================
+    # proxy command — local OpenAI-compatible proxy that attaches the user's
+    # OAuth-authenticated provider credentials to outbound requests. Lets
+    # external apps (OpenViking, Karakeep, Open WebUI, ...) ride a logged-in
+    # subscription without copy-pasting static API keys.
+    # =========================================================================
+    proxy_parser = subparsers.add_parser(
+        "proxy",
+        help="Local OpenAI-compatible proxy to OAuth providers",
+        description=(
+            "Run a local HTTP server that forwards OpenAI-compatible requests "
+            "to an OAuth-authenticated provider (e.g. Nous Portal). External "
+            "apps can point at the proxy with any bearer token; the proxy "
+            "attaches your real credentials."
+        ),
+    )
+    proxy_subparsers = proxy_parser.add_subparsers(dest="proxy_command")
+
+    proxy_start = proxy_subparsers.add_parser(
+        "start", help="Run the proxy in the foreground"
+    )
+    proxy_start.add_argument(
+        "--provider",
+        default="nous",
+        help="Upstream provider (default: nous). See `hermes proxy providers`.",
+    )
+    proxy_start.add_argument(
+        "--host",
+        default=None,
+        help="Bind address (default: 127.0.0.1). Use 0.0.0.0 to expose on LAN.",
+    )
+    proxy_start.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port (default: 8645)",
+    )
+
+    proxy_subparsers.add_parser(
+        "status", help="Show which proxy upstreams are ready"
+    )
+    proxy_subparsers.add_parser(
+        "providers", help="List available proxy upstream providers"
+    )
+    proxy_parser.set_defaults(func=cmd_proxy)
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # lsp command
+    # =========================================================================
+    try:
+        from agent.lsp.cli import register_subparser as _lsp_register
+        _lsp_register(subparsers)
+    except Exception as _lsp_err:  # noqa: BLE001
+        # LSP is optional infrastructure — never let a registration
+        # failure break the CLI overall.
+        logger.debug("LSP CLI registration failed: %s", _lsp_err)
 
     # =========================================================================
     # setup command
@@ -10061,6 +10385,16 @@ def main():
     )
     doctor_parser.add_argument(
         "--fix", action="store_true", help="Attempt to fix issues automatically"
+    )
+    doctor_parser.add_argument(
+        "--ack",
+        metavar="ADVISORY_ID",
+        default=None,
+        help=(
+            "Acknowledge a security advisory by ID and exit. After ack, the "
+            "advisory will no longer trigger startup banners. Run `hermes "
+            "doctor` first to see active advisories and their IDs."
+        ),
     )
     doctor_parser.set_defaults(func=cmd_doctor)
 
@@ -10801,9 +11135,18 @@ Examples:
     )
     computer_use_sub = computer_use_parser.add_subparsers(dest="computer_use_action")
 
-    computer_use_sub.add_parser(
+    computer_use_install = computer_use_sub.add_parser(
         "install",
         help="Install or repair the cua-driver binary (macOS)",
+    )
+    computer_use_install.add_argument(
+        "--upgrade",
+        action="store_true",
+        help=(
+            "Re-run the upstream installer even if cua-driver is already on "
+            "PATH. The upstream install.sh always pulls the latest release, "
+            "so this performs an in-place upgrade."
+        ),
     )
     computer_use_sub.add_parser(
         "status",
@@ -10813,14 +11156,27 @@ Examples:
     def cmd_computer_use(args):
         action = getattr(args, "computer_use_action", None)
         if action == "install":
-            from hermes_cli.tools_config import _run_post_setup
-            _run_post_setup("cua_driver")
+            from hermes_cli.tools_config import install_cua_driver
+            install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))
             return
         if action == "status":
             import shutil
+            import subprocess
             path = shutil.which("cua-driver")
             if path:
-                print(f"cua-driver: installed at {path}")
+                version = ""
+                try:
+                    version = subprocess.run(
+                        ["cua-driver", "--version"],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip()
+                except Exception:
+                    pass
+                if version:
+                    print(f"cua-driver: installed at {path} ({version})")
+                else:
+                    print(f"cua-driver: installed at {path}")
+                print("  Refresh to latest: hermes computer-use install --upgrade")
                 return
             print("cua-driver: not installed")
             print("  Run: hermes computer-use install")
@@ -11343,16 +11699,57 @@ Examples:
         description="Start Hermes Agent in ACP mode for editor integration (VS Code, Zed, JetBrains)",
     )
     _add_accept_hooks_flag(acp_parser)
+    acp_parser.add_argument(
+        "--version",
+        action="store_true",
+        dest="acp_version",
+        help="Print Hermes ACP version and exit",
+    )
+    acp_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify ACP dependencies and adapter imports, then exit",
+    )
+    acp_parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Run interactive Hermes provider/model setup for ACP terminal auth",
+    )
+    acp_parser.add_argument(
+        "--setup-browser",
+        action="store_true",
+        help="Install agent-browser + Playwright Chromium into ~/.hermes/node/ "
+             "for browser tool support (idempotent).",
+    )
+    acp_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        dest="assume_yes",
+        help="Accept all prompts (used by --setup-browser to skip the "
+             "~400 MB Chromium download confirmation).",
+    )
 
     def cmd_acp(args):
         """Launch Hermes Agent as an ACP server."""
         try:
             from acp_adapter.entry import main as acp_main
 
-            acp_main()
+            acp_argv = []
+            if getattr(args, "acp_version", False):
+                acp_argv.append("--version")
+            if getattr(args, "check", False):
+                acp_argv.append("--check")
+            if getattr(args, "setup", False):
+                acp_argv.append("--setup")
+            if getattr(args, "setup_browser", False):
+                acp_argv.append("--setup-browser")
+            if getattr(args, "assume_yes", False):
+                acp_argv.append("--yes")
+            acp_main(acp_argv)
         except ImportError:
-            print("ACP dependencies not installed.")
-            print("Install them with:  pip install -e '.[acp]'")
+            print("ACP dependencies not installed.", file=sys.stderr)
+            print("Install them with:  pip install -e '.[acp]'", file=sys.stderr)
             sys.exit(1)
 
     acp_parser.set_defaults(func=cmd_acp)
