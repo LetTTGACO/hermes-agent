@@ -327,10 +327,11 @@ class FeishuStreamingCardSession:
         # gateway owns streaming cadence; this session should not schedule its
         # own delayed flushes because every CardKit operation consumes a
         # sequence number.
-        next_text = merge_streaming_text(
-            self.current_text,
-            strip_streaming_cursor(text),
-        )
+        visible_text = strip_streaming_cursor(text)
+        if self.profile == CARDKIT_TOOL_PROGRESS_PROFILE:
+            next_text = visible_text
+        else:
+            next_text = merge_streaming_text(self.current_text, visible_text)
         if not next_text or next_text == self.current_text:
             return SendResult(success=True, message_id=self.message_id)
         await self._push_update(next_text, force=True)

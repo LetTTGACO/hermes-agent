@@ -163,6 +163,51 @@ def test_session_update_sends_small_delta_immediately():
     assert ("update", "card_123", "content", "hello there", 3) in client.calls
 
 
+def test_tool_progress_update_replaces_snapshot_instead_of_appending():
+    from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
+
+    client = FakeCardKitClient()
+    session = FeishuStreamingCardSession(
+        client=client,
+        chat_id="oc_chat",
+        send_card_reference=fake_send_card_reference,
+        profile="tool_progress",
+    )
+    asyncio.run(session.start('📝 skill_manage: "knowledge-pipeline" (×2)', reply_to=None, metadata=None))
+    asyncio.run(session.update('📝 skill_manage: "knowledge-pipeline" (×3)'))
+
+    assert (
+        "update",
+        "card_123",
+        "content",
+        '📝 skill_manage: "knowledge-pipeline" (×3)',
+        3,
+    ) in client.calls
+    assert "×2" not in client.calls[-1][3]
+
+
+def test_tool_progress_update_preserves_multiline_snapshot():
+    from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
+
+    client = FakeCardKitClient()
+    session = FeishuStreamingCardSession(
+        client=client,
+        chat_id="oc_chat",
+        send_card_reference=fake_send_card_reference,
+        profile="tool_progress",
+    )
+    asyncio.run(session.start("📝 first tool", reply_to=None, metadata=None))
+    asyncio.run(session.update("📝 first tool\n📝 second tool"))
+
+    assert (
+        "update",
+        "card_123",
+        "content",
+        "📝 first tool\n📝 second tool",
+        3,
+    ) in client.calls
+
+
 def test_session_update_does_not_schedule_background_flush_for_small_delta():
     from gateway.platforms.feishu_streaming_card import FeishuStreamingCardSession
 
