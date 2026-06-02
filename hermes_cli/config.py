@@ -212,7 +212,8 @@ _EXTRA_ENV_KEYS = frozenset({
     "MATRIX_RECOVERY_KEY",
     # Langfuse observability plugin — optional tuning keys + standard SDK vars.
     # Activation is via plugins.enabled (opt-in through `hermes plugins enable
-    # observability/langfuse`); credentials gate the plugin at runtime.
+    # observability/langfuse` or `hermes tools → Langfuse`); credentials gate
+    # the plugin at runtime.
     "HERMES_LANGFUSE_ENV",
     "HERMES_LANGFUSE_RELEASE",
     "HERMES_LANGFUSE_SAMPLE_RATE",
@@ -538,6 +539,65 @@ def get_project_root() -> Path:
     """Get the project installation directory."""
     return Path(__file__).parent.parent.resolve()
 
+def _resolve_hermes_uid_gid() -> tuple[Optional[int], Optional[int]]:
+    """Read the HERMES_UID / HERMES_GID env vars set by Docker deployments.
+
+    Docker containers running Hermes commonly set these to map the in-container
+    user to a host user so volume-mounted state files end up with the right
+    ownership. The entrypoint chowns the top-level HERMES_HOME once, but
+    subdirectories created at runtime by ``ensure_hermes_home()`` (especially
+    for profile namespaces under ``profiles/<name>/``) need the same chown
+    or they land as ``root:root`` and block subsequent uid-mapped workers
+    with ``PermissionError [Errno 13]``. See #34107.
+
+    Returns ``(uid, gid)`` parsed from the env vars, or ``(None, None)``
+    when either is missing/invalid. Returns ``(None, None)`` on Windows
+    too (where chown is a no-op anyway).
+    """
+    if sys.platform == "win32":
+        return None, None
+    uid_str = os.environ.get("HERMES_UID", "").strip()
+    gid_str = os.environ.get("HERMES_GID", "").strip()
+    try:
+        uid = int(uid_str) if uid_str else None
+    except ValueError:
+        uid = None
+    try:
+        gid = int(gid_str) if gid_str else None
+    except ValueError:
+        gid = None
+    return uid, gid
+
+
+def _chown_to_hermes_uid(path) -> None:
+    """Chown ``path`` to ``HERMES_UID:HERMES_GID`` if those env vars are set.
+
+    No-op when:
+      - Either env var is unset/invalid
+      - The current process isn't root (chown will EPERM — silently ignored)
+      - On Windows (chown semantics don't apply)
+
+    Used by :func:`_secure_dir` to keep ownership consistent across all
+    directories created by :func:`ensure_hermes_home` on Docker deployments.
+    See #34107.
+    """
+    uid, gid = _resolve_hermes_uid_gid()
+    if uid is None and gid is None:
+        return
+    try:
+        # os.chown with -1 means "don't change" for that field.
+        os.chown(
+            path,
+            uid if uid is not None else -1,
+            gid if gid is not None else -1,
+        )
+    except (OSError, AttributeError, NotImplementedError):
+        # OSError covers EPERM (not running as root) and ENOENT (race),
+        # both of which are non-fatal — the dir is still created and
+        # the entrypoint's startup chown -R will fix it on next restart.
+        pass
+
+
 def _secure_dir(path):
     """Set directory to owner-only access (0700 by default). No-op on Windows.
 
@@ -550,6 +610,11 @@ def _secure_dir(path):
     caddy, etc.) needs to traverse HERMES_HOME to reach a served subdirectory.
     The execute-only bit on a directory permits cd-through without exposing
     directory listings.
+
+    Also applies ``HERMES_UID``/``HERMES_GID``-based ownership when those env
+    vars are set (#34107 — Docker deployments need this so profile subdirs
+    created at runtime by kanban workers don't land as root:root and block
+    subsequent uid-mapped workers).
     """
     if is_managed():
         return
@@ -562,6 +627,7 @@ def _secure_dir(path):
         os.chmod(path, mode)
     except (OSError, NotImplementedError):
         pass
+    _chown_to_hermes_uid(path)
 
 
 def _is_container() -> bool:
@@ -777,7 +843,7 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
-    
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
@@ -1198,10 +1264,10 @@ DEFAULT_CONFIG = {
             "extra_body": {},
         },
     },
-    
+
     "display": {
         "compact": False,
-        "personality": "kawaii",
+        "personality": "",
         "resume_display": "full",
         # Recap tuning for /resume and startup resume. The defaults match the
         # historical hardcoded values; expose them as config so power users can
@@ -1279,11 +1345,27 @@ DEFAULT_CONFIG = {
         # responses and content messages are never touched.  Default 0
         # (disabled) preserves prior behavior.
         "ephemeral_system_ttl": 0,
-        # Per-platform display overrides:
-        # {"telegram": {"tool_progress": "all"},
-        # {"slack": {"tool_progress": "off"}}
-        # {"feishu": {"streaming": true}}
-        "platforms": {},
+        # Per-platform display/streaming overrides. Each key is a gateway
+        # platform ("telegram", "discord", "slack", …) mapping to a dict of
+        # display settings that override the global value for that platform
+        # only. A setting left unset here falls through to the global default.
+        #
+        # Shipped defaults encode the streaming experience that works best
+        # per platform:
+        #   - Telegram has native animated draft streaming (sendMessageDraft),
+        #     which is smooth, so streaming is on by default there.
+        #   - Discord/Slack/etc. only have edit-based streaming (repeated
+        #     editMessage), which flickers and is noticeably jankier, so
+        #     streaming is off by default there.
+        # These are gap-fillers: a user who explicitly sets, e.g.,
+        # display.platforms.discord.streaming: true keeps their value
+        # (config deep-merge has user values win over defaults). The global
+        # streaming.enabled master switch still gates everything — these
+        # per-platform flags only take effect once streaming is enabled.
+        "platforms": {
+            "telegram": {"streaming": True},
+            "discord": {"streaming": False},
+        },
         # Gateway runtime-metadata footer appended to the FINAL message of a turn
         # (disabled by default to keep replies minimal). When enabled, renders
         # e.g. `model · 68% · ~/projects/hermes`. Per-platform overrides go under
@@ -1357,7 +1439,7 @@ DEFAULT_CONFIG = {
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
     },
-    
+
     # Text-to-speech configuration
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
@@ -1408,10 +1490,10 @@ DEFAULT_CONFIG = {
             # "normalize_audio": True,
         },
     },
-    
+
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -1421,6 +1503,12 @@ DEFAULT_CONFIG = {
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
+        },
+        "elevenlabs": {
+            "model_id": "scribe_v2",  # scribe_v2, scribe_v1
+            "language_code": "",  # auto-detect by default; set to "eng", "spa", "fra", etc. to force
+            "tag_audio_events": False,
+            "diarize": False,
         },
     },
 
@@ -1432,13 +1520,13 @@ DEFAULT_CONFIG = {
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
     },
-    
+
     "human_delay": {
         "mode": "off",
         "min_ms": 800,
         "max_ms": 2500,
     },
-    
+
     # Context engine -- controls how the context window is managed when
     # approaching the model's token limit.
     # "compressor" = built-in lossy summarization (default).
@@ -1580,6 +1668,17 @@ DEFAULT_CONFIG = {
         # Archive a skill (move to skills/.archive/) after this many days
         # without use. Archived skills are recoverable — no auto-deletion.
         "archive_after_days": 90,
+        # Also prune (archive) bundled built-in skills after the inactivity
+        # period, not just agent-created ones. ON by default. Built-ins are
+        # normally restored on every `hermes update`, so pruning them only
+        # sticks because a suppression list tells the re-seeder to leave them
+        # archived. Hub-installed skills are NEVER pruned here — they have an
+        # external upstream owner. Built-ins accrue usage telemetry and their
+        # inactivity clock starts the first time the curator sees them, so a
+        # long-unused built-in is archived only after archive_after_days of
+        # genuine non-use (never a mass-prune on the first run). Set to false
+        # to keep all bundled built-ins permanently.
+        "prune_builtins": True,
         # Pre-run backup: before every real curator pass (dry-run is
         # skipped), snapshot ~/.hermes/skills/ into
         # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz so the
@@ -1885,15 +1984,6 @@ DEFAULT_CONFIG = {
         "level": "INFO",       # Minimum level for agent.log: DEBUG, INFO, WARNING
         "max_size_mb": 5,      # Max size per log file before rotation
         "backup_count": 3,     # Number of rotated backup files to keep
-        # Periodic process memory usage logging (gateway only). Emits a
-        # grep-friendly "[MEMORY] rss=...MB ..." line at the configured
-        # interval so slow leaks in the long-lived gateway are visible
-        # in agent.log / gateway.log as a time series. Ported from
-        # cline/cline#10343.
-        "memory_monitor": {
-            "enabled": True,         # Flip to false to silence the periodic line
-            "interval_seconds": 300, # Default: every 5 minutes
-        },
     },
 
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
@@ -1907,7 +1997,7 @@ DEFAULT_CONFIG = {
         # Disk cache TTL in hours.  Beyond this, the CLI refetches on the
         # next /model or `hermes model` invocation; network failures
         # silently fall back to the stale cache.
-        "ttl_hours": 24,
+        "ttl_hours": 1,
         # Optional per-provider override URLs for third parties that want
         # to self-host their own curation list using the same schema.
         # Example:
@@ -1965,6 +2055,45 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+    },
+
+    # Real-time token streaming to messaging platforms (Telegram, Discord,
+    # Slack, etc.). Read at the top level by the gateway; absent this block the
+    # gateway falls back to these same defaults, so adding it here only makes
+    # the feature discoverable in config.yaml — it does not change behavior.
+    #
+    # Disabled by default: streaming costs extra edit/draft API calls per
+    # response. Set ``enabled: true`` and restart the gateway to turn it on.
+    "streaming": {
+        # Master switch. When false, each response is delivered as a single
+        # final message (no progressive updates).
+        "enabled": False,
+        # Transport selection:
+        #   "auto"  — prefer native draft streaming where the platform
+        #             supports it (Telegram DMs via sendMessageDraft,
+        #             Bot API 9.5+) and fall back to edit-based elsewhere.
+        #             Safe global default: platforms without draft support
+        #             (Discord, Slack, Matrix, Telegram groups) transparently
+        #             use the edit path, so "auto" only upgrades chats that
+        #             can render the smoother native preview.
+        #   "draft" — explicitly request native drafts; falls back to edit
+        #             when the platform/chat doesn't support them.
+        #   "edit"  — progressive editMessageText only (legacy behavior).
+        #   "off"   — disable streaming entirely (same as enabled: false).
+        "transport": "auto",
+        # Minimum seconds between progressive edits — tuned for Telegram's
+        # ~1 edit/s flood envelope.
+        "edit_interval": 0.8,
+        # Flush the buffer to the platform once this many characters have
+        # accumulated, so short replies feel near-instant.
+        "buffer_threshold": 24,
+        # Cursor glyph appended to the in-progress message while streaming.
+        "cursor": " \u2589",
+        # When >0, the final edit for a long-running streamed response is
+        # delivered as a fresh message if the preview has been visible at
+        # least this many seconds, so the platform timestamp reflects
+        # completion time. Telegram only; other platforms ignore it.
+        "fresh_final_after_seconds": 60.0,
     },
 
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
@@ -2155,7 +2284,7 @@ DEFAULT_CONFIG = {
 
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 24,
+    "_config_version": 25,
 }
 
 # =============================================================================
@@ -2740,9 +2869,10 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
     "ELEVENLABS_API_KEY": {
-        "description": "ElevenLabs API key for premium text-to-speech voices",
+        "description": "ElevenLabs API key for premium text-to-speech voices and Scribe transcription",
         "prompt": "ElevenLabs API key",
         "url": "https://elevenlabs.io/",
+        "tools": ["elevenlabs_tts", "voice_transcription"],
         "password": True,
         "category": "tool",
     },
@@ -3257,22 +3387,22 @@ OPTIONAL_ENV_VARS = {
 def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     """
     Check which environment variables are missing.
-    
+
     Returns list of dicts with var info for missing variables.
     """
     missing = []
-    
+
     # Check required vars
     for var_name, info in REQUIRED_ENV_VARS.items():
         if not get_env_value(var_name):
             missing.append({"name": var_name, **info, "is_required": True})
-    
+
     # Check optional vars (if not required_only)
     if not required_only:
         for var_name, info in OPTIONAL_ENV_VARS.items():
             if not get_env_value(var_name):
                 missing.append({"name": var_name, **info, "is_required": False})
-    
+
     return missing
 
 
@@ -3330,7 +3460,7 @@ def _set_nested(config, dotted_key: str, value):
 def get_missing_config_fields() -> List[Dict[str, Any]]:
     """
     Check which config fields are missing or outdated (recursive).
-    
+
     Walks the DEFAULT_CONFIG tree at arbitrary depth and reports any keys
     present in defaults but absent from the user's loaded config.
     """
@@ -3666,7 +3796,7 @@ def get_custom_provider_context_length(
 def check_config_version() -> Tuple[int, int]:
     """
     Check config version.
-    
+
     Returns (current_version, latest_version).
     """
     config = load_config()
@@ -3685,7 +3815,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions",
+    "sessions", "streaming",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -3924,11 +4054,11 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
     """
     Migrate config to latest version, prompting for new required fields.
-    
+
     Args:
         interactive: If True, prompt user for missing values
         quiet: If True, suppress output
-        
+
     Returns:
         Dict with migration results: {"env_added": [...], "config_added": [...], "warnings": [...]}
     """
@@ -3944,7 +4074,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
 
     # Check config version
     current_ver, latest_ver = check_config_version()
-    
+
     # ── Version 3 → 4: migrate tool progress from .env to config.yaml ──
     if current_ver < 4:
         config = load_config()
@@ -3967,7 +4097,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             save_config(config)
             if not quiet:
                 print(f"  ✓ Migrated tool progress to config.yaml: {display['tool_progress']}")
-    
+
     # ── Version 4 → 5: add timezone field ──
     if current_ver < 5:
         config = load_config()
@@ -4348,28 +4478,44 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         f"{', '.join(added_aux)}"
                     )
 
+    # ── Version 24 → 25: lower model_catalog TTL 24h → 1h ──
+    # The model picker now refreshes its curated list hourly so freshly
+    # published model-catalog.json deploys reach users without a day-long
+    # stale window. Only rewrite the OLD default (24) — never clobber a
+    # value the user deliberately customized.
+    if current_ver < 25:
+        config = read_raw_config()
+        raw_mc = config.get("model_catalog")
+        if isinstance(raw_mc, dict) and raw_mc.get("ttl_hours") == 24:
+            raw_mc["ttl_hours"] = 1
+            config["model_catalog"] = raw_mc
+            save_config(config)
+            results["config_added"].append("model_catalog.ttl_hours 24→1")
+            if not quiet:
+                print("  ✓ Lowered model_catalog.ttl_hours to 1 (hourly picker refresh)")
+
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")
-    
+
     # Check for missing required env vars
     missing_env = get_missing_env_vars(required_only=True)
-    
+
     if missing_env and not quiet:
         print("\n⚠️  Missing required environment variables:")
         for var in missing_env:
             print(f"   • {var['name']}: {var['description']}")
-    
+
     if interactive and missing_env:
         print("\nLet's configure them now:\n")
         for var in missing_env:
             if var.get("url"):
                 print(f"  Get your key at: {var['url']}")
-            
+
             if var.get("password"):
                 value = masked_secret_prompt(f"  {var['prompt']}: ")
             else:
                 value = input(f"  {var['prompt']}: ").strip()
-            
+
             if value:
                 save_env_value(var["name"], value)
                 results["env_added"].append(var["name"])
@@ -4377,7 +4523,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             else:
                 results["warnings"].append(f"Skipped {var['name']} - some features may not work")
             print()
-    
+
     # Check for missing optional env vars and offer to configure interactively
     # Skip "advanced" vars (like OPENAI_BASE_URL) -- those are for power users
     missing_optional = get_missing_env_vars(required_only=False)
@@ -4386,7 +4532,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         v for v in missing_optional
         if v["name"] not in required_names and not v.get("advanced")
     ]
-    
+
     # Only offer to configure env vars that are NEW since the user's previous version
     new_var_names = set()
     for ver in range(current_ver + 1, latest_ver + 1):
@@ -4429,22 +4575,22 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     print()
             else:
                 print("  Set later with: hermes config set <key> <value>")
-    
+
     # Check for missing config fields
     missing_config = get_missing_config_fields()
-    
+
     if missing_config:
         config = load_config()
-        
+
         for field in missing_config:
             key = field["key"]
             default = field["default"]
-            
+
             _set_nested(config, key, default)
             results["config_added"].append(key)
             if not quiet:
                 print(f"  ✓ Added {key} = {default}")
-        
+
         # Update version and save
         config["_config_version"] = latest_ver
         save_config(config)
@@ -5230,7 +5376,7 @@ def save_env_value(key: str, value: str):
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
     # Preserve original permissions so Docker volume mounts aren't clobbered.
     original_mode = None
@@ -5378,7 +5524,7 @@ def get_env_value(key: str) -> Optional[str]:
     # Check environment first
     if key in os.environ:
         return os.environ[key]
-    
+
     # Then check .env file
     env_vars = load_env()
     return env_vars.get(key)
@@ -5401,23 +5547,23 @@ def redact_key(key: str) -> str:
 def show_config():
     """Display current configuration."""
     config = load_config()
-    
+
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│              ⚕ Hermes Configuration                    │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
-    
+
     # Paths
     print()
     print(color("◆ Paths", Colors.CYAN, Colors.BOLD))
     print(f"  Config:       {get_config_path()}")
     print(f"  Secrets:      {get_env_path()}")
     print(f"  Install:      {get_project_root()}")
-    
+
     # API Keys
     print()
     print(color("◆ API Keys", Colors.CYAN, Colors.BOLD))
-    
+
     keys = [
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
@@ -5429,25 +5575,25 @@ def show_config():
         ("BROWSER_USE_API_KEY", "Browser Use"),
         ("FAL_KEY", "FAL"),
     ]
-    
+
     for env_key, name in keys:
         value = get_env_value(env_key)
         print(f"  {name:<14} {redact_key(value)}")
     from hermes_cli.auth import get_anthropic_key
     anthropic_value = get_anthropic_key()
     print(f"  {'Anthropic':<14} {redact_key(anthropic_value)}")
-    
+
     # Model settings
     print()
     print(color("◆ Model", Colors.CYAN, Colors.BOLD))
     print(f"  Model:        {config.get('model', 'not set')}")
     print(f"  Max turns:    {config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])}")
-    
+
     # Display
     print()
     print(color("◆ Display", Colors.CYAN, Colors.BOLD))
     display = config.get('display', {})
-    print(f"  Personality:  {display.get('personality', 'kawaii')}")
+    print(f"  Personality:  {display.get('personality') or 'none'}")
     print(f"  Reasoning:    {'on' if display.get('show_reasoning', False) else 'off'}")
     print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
     ump = display.get('user_message_preview', {}) if isinstance(display.get('user_message_preview', {}), dict) else {}
@@ -5462,7 +5608,7 @@ def show_config():
     print(f"  Backend:      {terminal.get('backend', 'local')}")
     print(f"  Working dir:  {terminal.get('cwd', '.')}")
     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
-    
+
     if terminal.get('backend') == 'docker':
         print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
     elif terminal.get('backend') == 'singularity':
@@ -5480,7 +5626,7 @@ def show_config():
         ssh_user = get_env_value('TERMINAL_SSH_USER')
         print(f"  SSH host:     {ssh_host or '(not set)'}")
         print(f"  SSH user:     {ssh_user or '(not set)'}")
-    
+
     # Timezone
     print()
     print(color("◆ Timezone", Colors.CYAN, Colors.BOLD))
@@ -5507,7 +5653,7 @@ def show_config():
         comp_provider = _aux_comp.get('provider', 'auto')
         if comp_provider and comp_provider != 'auto':
             print(f"  Provider:     {comp_provider}")
-    
+
     # Auxiliary models
     auxiliary = config.get('auxiliary', {})
     aux_tasks = {
@@ -5529,17 +5675,17 @@ def show_config():
                 if mdl:
                     parts.append(f"model={mdl}")
                 print(f"  {label:12s}  {', '.join(parts)}")
-    
+
     # Messaging
     print()
     print(color("◆ Messaging Platforms", Colors.CYAN, Colors.BOLD))
-    
+
     telegram_token = get_env_value('TELEGRAM_BOT_TOKEN')
     discord_token = get_env_value('DISCORD_BOT_TOKEN')
-    
+
     print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
     print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
-    
+
     # Skill config
     try:
         from agent.skill_utils import discover_all_skill_config_vars, resolve_skill_config_values
@@ -5571,12 +5717,12 @@ def edit_config():
         managed_error("edit configuration")
         return
     config_path = get_config_path()
-    
+
     # Ensure config exists
     if not config_path.exists():
         save_config(DEFAULT_CONFIG)
         print(f"Created {config_path}")
-    
+
     # Find editor
     editor = os.getenv('EDITOR') or os.getenv('VISUAL')
 
@@ -5595,12 +5741,12 @@ def edit_config():
             if shutil.which(cmd):
                 editor = cmd
                 break
-    
+
     if not editor:
         print("No editor found. Config file is at:")
         print(f"  {config_path}")
         return
-    
+
     print(f"Opening {config_path} in {editor}...")
     subprocess.run([editor, str(config_path)])
 
@@ -5622,12 +5768,12 @@ def set_config_value(key: str, value: str):
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
         'GITHUB_TOKEN', 'HONCHO_API_KEY',
     ]
-    
+
     if key.upper() in api_keys or key.upper().endswith(('_API_KEY', '_TOKEN')) or key.upper().startswith('TERMINAL_SSH'):
         save_env_value(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return
-    
+
     # Otherwise it goes to config.yaml
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
@@ -5639,7 +5785,7 @@ def set_config_value(key: str, value: str):
                 user_config = yaml.safe_load(f) or {}
         except Exception:
             user_config = {}
-    
+
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
@@ -5656,12 +5802,12 @@ def set_config_value(key: str, value: str):
         value = float(value)
 
     _set_nested(user_config, key, value)
-    
+
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
     from utils import atomic_yaml_write
     atomic_yaml_write(config_path, user_config, sort_keys=False)
-    
+
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     _config_to_env_sync = {
@@ -5700,13 +5846,13 @@ def set_config_value(key: str, value: str):
 def config_command(args):
     """Handle config subcommands."""
     subcmd = getattr(args, 'config_command', None)
-    
+
     if subcmd is None or subcmd == "show":
         show_config()
-    
+
     elif subcmd == "edit":
         edit_config()
-    
+
     elif subcmd == "set":
         key = getattr(args, 'key', None)
         value = getattr(args, 'value', None)
@@ -5719,81 +5865,81 @@ def config_command(args):
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
         set_config_value(key, value)
-    
+
     elif subcmd == "path":
         print(get_config_path())
-    
+
     elif subcmd == "env-path":
         print(get_env_path())
-    
+
     elif subcmd == "migrate":
         print()
         print(color("🔄 Checking configuration for updates...", Colors.CYAN, Colors.BOLD))
         print()
-        
+
         # Check what's missing
         missing_env = get_missing_env_vars(required_only=False)
         missing_config = get_missing_config_fields()
         current_ver, latest_ver = check_config_version()
-        
+
         if not missing_env and not missing_config and current_ver >= latest_ver:
             print(color("✓ Configuration is up to date!", Colors.GREEN))
             print()
             return
-        
+
         # Show what needs to be updated
         if current_ver < latest_ver:
             print(f"  Config version: {current_ver} → {latest_ver}")
-        
+
         if missing_config:
             print(f"\n  {len(missing_config)} new config option(s) will be added with defaults")
-        
+
         required_missing = [v for v in missing_env if v.get("is_required")]
         optional_missing = [
             v for v in missing_env
             if not v.get("is_required") and not v.get("advanced")
         ]
-        
+
         if required_missing:
             print(f"\n  ⚠️  {len(required_missing)} required API key(s) missing:")
             for var in required_missing:
                 print(f"     • {var['name']}")
-        
+
         if optional_missing:
             print(f"\n  ℹ️  {len(optional_missing)} optional API key(s) not configured:")
             for var in optional_missing:
                 tools = var.get("tools", [])
                 tools_str = f" (enables: {', '.join(tools[:2])})" if tools else ""
                 print(f"     • {var['name']}{tools_str}")
-        
+
         print()
-        
+
         # Run migration
         results = migrate_config(interactive=True, quiet=False)
-        
+
         print()
         if results["env_added"] or results["config_added"]:
             print(color("✓ Configuration updated!", Colors.GREEN))
-        
+
         if results["warnings"]:
             print()
             for warning in results["warnings"]:
                 print(color(f"  ⚠️  {warning}", Colors.YELLOW))
-        
+
         print()
-    
+
     elif subcmd == "check":
         # Non-interactive check for what's missing
         print()
         print(color("📋 Configuration Status", Colors.CYAN, Colors.BOLD))
         print()
-        
+
         current_ver, latest_ver = check_config_version()
         if current_ver >= latest_ver:
             print(f"  Config version: {current_ver} ✓")
         else:
             print(color(f"  Config version: {current_ver} → {latest_ver} (update available)", Colors.YELLOW))
-        
+
         print()
         print(color("  Required:", Colors.BOLD))
         for var_name in REQUIRED_ENV_VARS:
@@ -5801,7 +5947,7 @@ def config_command(args):
                 print(f"    ✓ {var_name}")
             else:
                 print(color(f"    ✗ {var_name} (missing)", Colors.RED))
-        
+
         print()
         print(color("  Optional:", Colors.BOLD))
         for var_name, info in OPTIONAL_ENV_VARS.items():
@@ -5811,15 +5957,15 @@ def config_command(args):
                 tools = info.get("tools", [])
                 tools_str = f" → {', '.join(tools[:2])}" if tools else ""
                 print(color(f"    ○ {var_name}{tools_str}", Colors.DIM))
-        
+
         missing_config = get_missing_config_fields()
         if missing_config:
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
-        
+
         print()
-    
+
     else:
         print(f"Unknown config command: {subcmd}")
         print()

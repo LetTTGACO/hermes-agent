@@ -263,6 +263,12 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        # #29346: a tool/segment boundary means what we delivered was an interim
+        # preamble, not the final answer — clear the flags so a premature setter
+        # can't fool the gateway. Safe: got_done returns before any reset, and
+        # run.py reads these only after the consumer task exits.
+        self._final_response_sent = False
+        self._final_content_delivered = False
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -550,6 +556,9 @@ class GatewayStreamConsumer:
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
+                        # A segment-break finalize closes a preamble, not the
+                        # turn-final answer — only got_done marks delivered (#29346).
+                        is_turn_final=got_done,
                     )
                     self._last_edit_time = time.monotonic()
 
@@ -561,13 +570,14 @@ class GatewayStreamConsumer:
                     if self._accumulated:
                         if self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
-                        elif current_update_visible:
-                            # The _DONE edit above already ran with
-                            # finalize=True and succeeded.  Treat it as the
-                            # confirmed final delivery; sending another
-                            # finalize for the same message can be harmful for
-                            # stateful card transports that untrack/close the
-                            # session on first success.
+                        elif (
+                            current_update_visible
+                            and not self._adapter_requires_finalize
+                        ):
+                            # Mid-stream edit above already delivered the
+                            # final accumulated content.  Skip the redundant
+                            # final edit — but only for adapters that don't
+                            # need an explicit finalize signal.
                             self._final_response_sent = True
                             self._final_content_delivered = True
                         elif self._message_id:
@@ -1058,11 +1068,16 @@ class GatewayStreamConsumer:
         age = time.monotonic() - self._message_created_ts
         return age >= threshold
 
-    async def _try_fresh_final(self, text: str) -> bool:
+    async def _try_fresh_final(self, text: str, *, is_turn_final: bool = True) -> bool:
         """Send ``text`` as a brand-new message (best-effort delete the old
         preview) so the platform's visible timestamp reflects completion
         time.  Returns True on successful delivery, False on any failure so
         the caller falls back to the normal edit path.
+
+        ``is_turn_final`` is False when finalizing an interim segment at a tool
+        boundary (a preamble) rather than the turn-final answer; the
+        final-delivery flag is then left unset so the gateway still delivers the
+        real answer from the next API call (#29346).
 
         Ported from openclaw/openclaw#72038.
         """
@@ -1108,7 +1123,8 @@ class GatewayStreamConsumer:
             self._message_created_ts = None
         self._already_sent = True
         self._last_sent_text = text
-        self._final_response_sent = True
+        if is_turn_final:
+            self._final_response_sent = True
         return True
 
     def _primary_stream_send_metadata(self) -> dict:
@@ -1123,7 +1139,9 @@ class GatewayStreamConsumer:
         metadata["cardkit_streaming"] = True
         return metadata
 
-    async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
+    async def _send_or_edit(
+        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+    ) -> bool:
         """Send or edit the streaming message.
 
         Returns True if the text was successfully delivered (sent or edited),
@@ -1217,7 +1235,9 @@ class GatewayStreamConsumer:
                     if (
                         finalize
                         and self._should_send_fresh_final()
-                        and await self._try_fresh_final(text)
+                        and await self._try_fresh_final(
+                            text, is_turn_final=is_turn_final,
+                        )
                     ):
                         return True
                     # Edit existing message
