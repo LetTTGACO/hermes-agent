@@ -1752,6 +1752,10 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        # Finalize streaming cards while the SDK client is still available,
+        # before websocket teardown, so they don't get stuck on Feishu's UI.
+        if FEISHU_AVAILABLE and self._cardkit_sessions:
+            await self._close_all_cardkit_sessions()
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1975,6 +1979,30 @@ class FeishuAdapter(BasePlatformAdapter):
         if not chat_sessions:
             open_by_chat.pop(chat_id, None)
 
+    async def _close_all_cardkit_sessions(self) -> None:
+        """Best-effort close of every open CardKit streaming session.
+
+        Called from :meth:`disconnect` so streaming cards do not get stuck on
+        Feishu's UI after a gateway restart (mirrors DingTalk, which finalizes
+        all streaming cards on disconnect).  Errors are swallowed so one bad
+        session never blocks teardown of the rest.
+        """
+        sessions = getattr(self, "_cardkit_sessions", {})
+        if not sessions:
+            return
+        for message_id, session in list(sessions.items()):
+            try:
+                await session.close(getattr(session, "current_text", None))
+            except Exception as exc:
+                logger.debug(
+                    "[Feishu] CardKit disconnect close failed for %s: %s",
+                    message_id,
+                    exc,
+                    exc_info=True,
+                )
+        self._cardkit_sessions.clear()
+        self._cardkit_open_by_chat.clear()
+
     async def _send_static_cardkit(
         self,
         cardkit_client: Any,
@@ -2113,7 +2141,12 @@ class FeishuAdapter(BasePlatformAdapter):
         session = sessions.get(message_id)
         if session is not None:
             try:
-                if finalize:
+                # run.py passes finalize=True on EVERY tool_progress edit, but a
+                # tool_progress card must stay streaming across edits (it is
+                # closed later by _close_cardkit_siblings when the next
+                # assistant/static card is sent). Only the assistant/static
+                # profiles close on finalize; tool_progress always updates.
+                if finalize and getattr(session, "profile", None) != CARDKIT_TOOL_PROGRESS_PROFILE:
                     result = await session.close(content)
                     if result.success:
                         sessions.pop(message_id, None)
