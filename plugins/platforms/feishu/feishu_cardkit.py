@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 import logging
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from gateway.platforms.base import SendResult
 
@@ -305,3 +305,166 @@ class FeishuCardKitClient:
         )
         response = await self._card_resource().asettings(request)
         self._ensure_success(response, "close card")
+
+
+SendCardReference = Callable[..., Awaitable[SendResult]]
+
+
+class FeishuStreamingCardSession:
+    """Manages a single CardKit streaming card lifecycle.
+
+    Wraps :class:`FeishuCardKitClient` to create a card, send a reference
+    message into the chat, push incremental text updates, and close the card
+    when streaming ends.  All public methods are idempotent and return a
+    :class:`SendResult`.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: Any,
+        chat_id: str,
+        send_card_reference: SendCardReference,
+        profile: str = CARDKIT_ASSISTANT_PROFILE,
+    ):
+        self.client = client
+        self.chat_id = chat_id
+        self.send_card_reference = send_card_reference
+        self.profile = profile
+        self.card_id: Optional[str] = None
+        self.message_id: Optional[str] = None
+        self.sequence = 1
+        self.current_text = ""
+        self.closed = False
+
+    async def start(
+        self,
+        initial_text: str,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Create the card, send the reference message, push initial content."""
+        if self.card_id and self.message_id:
+            return SendResult(success=True, message_id=self.message_id)
+
+        self.card_id = await self.client.create_card(
+            content=strip_streaming_cursor(initial_text),
+            streaming_mode=True,
+            profile=self.profile,
+        )
+
+        send_result = await self.send_card_reference(
+            card_id=self.card_id,
+            chat_id=self.chat_id,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not send_result.success:
+            return send_result
+
+        self.message_id = send_result.message_id
+
+        text = strip_streaming_cursor(initial_text)
+        if text:
+            try:
+                await self._push_update(text, force=True)
+            except Exception as exc:
+                logger.warning(
+                    "[Feishu] CardKit initial update failed for %s: %s",
+                    self.card_id,
+                    exc,
+                )
+                await self.close(None)
+                return SendResult(
+                    success=False,
+                    message_id=self.message_id,
+                    error=str(exc),
+                )
+
+        return SendResult(
+            success=True,
+            message_id=self.message_id,
+            raw_response=getattr(send_result, "raw_response", None),
+        )
+
+    async def update(self, text: str) -> SendResult:
+        """Push a merged full-text snapshot to the card."""
+        if self.closed or not self.card_id or not self.message_id:
+            return SendResult(success=False, error="CardKit session is not active")
+
+        visible_text = strip_streaming_cursor(text)
+        if self.profile == CARDKIT_TOOL_PROGRESS_PROFILE:
+            next_text = visible_text
+        else:
+            next_text = merge_streaming_text(self.current_text, visible_text)
+
+        if not next_text or next_text == self.current_text:
+            return SendResult(success=True, message_id=self.message_id)
+
+        await self._push_update(next_text, force=True)
+        return SendResult(success=True, message_id=self.message_id)
+
+    async def close(self, final_text: Optional[str] = None) -> SendResult:
+        """Push final text and disable streaming mode."""
+        if self.closed:
+            return SendResult(success=True, message_id=self.message_id)
+
+        if not self.card_id or not self.message_id:
+            return SendResult(success=False, error="CardKit session is not active")
+
+        merged = self.current_text
+        if final_text:
+            merged = merge_streaming_text(merged, strip_streaming_cursor(final_text))
+
+        if merged and merged != self.current_text:
+            try:
+                await self._push_update(merged, force=True)
+            except Exception as exc:
+                logger.warning(
+                    "[Feishu] CardKit final update failed for %s: %s",
+                    self.card_id,
+                    exc,
+                )
+                return SendResult(
+                    success=False,
+                    message_id=self.message_id,
+                    error=str(exc),
+                )
+
+        self.sequence += 1
+        try:
+            await self.client.close_card(
+                self.card_id,
+                merged or self.current_text,
+                self.sequence,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] CardKit close failed for %s: %s",
+                self.card_id,
+                exc,
+            )
+            return SendResult(
+                success=False,
+                message_id=self.message_id,
+                error=str(exc),
+            )
+
+        self.closed = True
+        return SendResult(success=True, message_id=self.message_id)
+
+    async def _push_update(self, text: str, *, force: bool) -> None:
+        """Push a text snapshot to the card element."""
+        if not self.card_id:
+            return
+        if not force and text == self.current_text:
+            return
+        self.sequence += 1
+        await self.client.update_element_content(
+            self.card_id,
+            CARD_CONTENT_ELEMENT_ID,
+            text,
+            self.sequence,
+        )
+        self.current_text = text
