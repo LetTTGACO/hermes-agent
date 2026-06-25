@@ -380,6 +380,7 @@ class FeishuStreamingCardSession:
                     success=False,
                     message_id=self.message_id,
                     error=str(exc),
+                    raw_response=getattr(send_result, "raw_response", None),
                 )
 
         return SendResult(
