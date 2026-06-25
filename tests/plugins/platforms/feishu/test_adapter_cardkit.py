@@ -639,3 +639,185 @@ class TestEditMessageCardkit:
             {"text": "standard content"},
             ensure_ascii=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_edit_tool_progress_finalize_calls_update_not_close(self):
+        # tool_progress cards must stay streaming across finalize=True edits
+        # (run.py passes finalize=True on every progress edit). Only the
+        # assistant profile should close on finalize.
+        adapter = self._adapter()
+        result = SendResult(success=True, message_id="msg_tp")
+        session = SimpleNamespace(
+            profile=CARDKIT_TOOL_PROGRESS_PROFILE,
+            update=AsyncMock(return_value=result),
+            close=AsyncMock(return_value=SendResult(success=True, message_id="msg_tp")),
+        )
+        adapter._cardkit_sessions = {"msg_tp": session}
+        adapter._cardkit_open_by_chat = {"chat_1": {"msg_tp": session}}
+
+        actual = await adapter.edit_message(
+            "chat_1",
+            "msg_tp",
+            "progress content",
+            finalize=True,
+        )
+
+        assert actual is result
+        session.update.assert_awaited_once_with("progress content")
+        session.close.assert_not_awaited()
+        # session REMAINS tracked so subsequent edits hit the CardKit path
+        assert adapter._cardkit_sessions == {"msg_tp": session}
+        assert adapter._cardkit_open_by_chat == {"chat_1": {"msg_tp": session}}
+
+    @pytest.mark.asyncio
+    async def test_edit_assistant_finalize_calls_close_and_pops(self):
+        adapter = self._adapter()
+        result = SendResult(success=True, message_id="msg_asst")
+        session = SimpleNamespace(
+            profile=CARDKIT_ASSISTANT_PROFILE,
+            update=AsyncMock(return_value=SendResult(success=True, message_id="msg_asst")),
+            close=AsyncMock(return_value=result),
+        )
+        adapter._cardkit_sessions = {"msg_asst": session}
+        adapter._cardkit_open_by_chat = {"chat_1": {"msg_asst": session}}
+
+        actual = await adapter.edit_message(
+            "chat_1",
+            "msg_asst",
+            "final content",
+            finalize=True,
+        )
+
+        assert actual is result
+        session.close.assert_awaited_once_with("final content")
+        session.update.assert_not_awaited()
+        assert adapter._cardkit_sessions == {}
+        assert adapter._cardkit_open_by_chat == {}
+
+    @pytest.mark.asyncio
+    async def test_edit_tool_progress_non_finalize_calls_update(self):
+        adapter = self._adapter()
+        result = SendResult(success=True, message_id="msg_tp")
+        session = SimpleNamespace(
+            profile=CARDKIT_TOOL_PROGRESS_PROFILE,
+            update=AsyncMock(return_value=result),
+            close=AsyncMock(),
+        )
+        adapter._cardkit_sessions = {"msg_tp": session}
+        adapter._cardkit_open_by_chat = {"chat_1": {"msg_tp": session}}
+
+        actual = await adapter.edit_message(
+            "chat_1",
+            "msg_tp",
+            "more progress",
+            finalize=False,
+        )
+
+        assert actual is result
+        session.update.assert_awaited_once_with("more progress")
+        session.close.assert_not_awaited()
+        assert adapter._cardkit_sessions == {"msg_tp": session}
+        assert adapter._cardkit_open_by_chat == {"chat_1": {"msg_tp": session}}
+
+
+class TestDisconnectCardkitCleanup:
+    @staticmethod
+    def _adapter():
+        adapter = object.__new__(FeishuAdapter)
+        adapter._cardkit_sessions = {}
+        adapter._cardkit_open_by_chat = {}
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_close_all_cardkit_sessions_closes_each_and_clears_dicts(self):
+        adapter = self._adapter()
+        session_a = SimpleNamespace(
+            current_text="alpha",
+            close=AsyncMock(return_value=SendResult(success=True, message_id="msg_a")),
+        )
+        session_b = SimpleNamespace(
+            current_text="beta",
+            close=AsyncMock(return_value=SendResult(success=True, message_id="msg_b")),
+        )
+        adapter._cardkit_sessions = {"msg_a": session_a, "msg_b": session_b}
+        adapter._cardkit_open_by_chat = {
+            "chat_1": {"msg_a": session_a},
+            "chat_2": {"msg_b": session_b},
+        }
+
+        await adapter._close_all_cardkit_sessions()
+
+        session_a.close.assert_awaited_once_with("alpha")
+        session_b.close.assert_awaited_once_with("beta")
+        assert adapter._cardkit_sessions == {}
+        assert adapter._cardkit_open_by_chat == {}
+
+    @pytest.mark.asyncio
+    async def test_close_all_cardkit_sessions_swallows_errors_and_still_clears(self):
+        # one session raises during close: the other must still be closed and
+        # both dicts must still be cleared (best-effort cleanup).
+        adapter = self._adapter()
+        raising_session = SimpleNamespace(
+            current_text="raising",
+            close=AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        ok_session = SimpleNamespace(
+            current_text="ok",
+            close=AsyncMock(return_value=SendResult(success=True, message_id="msg_ok")),
+        )
+        adapter._cardkit_sessions = {"msg_raise": raising_session, "msg_ok": ok_session}
+        adapter._cardkit_open_by_chat = {
+            "chat_1": {"msg_raise": raising_session, "msg_ok": ok_session},
+        }
+
+        await adapter._close_all_cardkit_sessions()
+
+        raising_session.close.assert_awaited_once_with("raising")
+        ok_session.close.assert_awaited_once_with("ok")
+        assert adapter._cardkit_sessions == {}
+        assert adapter._cardkit_open_by_chat == {}
+
+    @pytest.mark.asyncio
+    async def test_close_all_cardkit_sessions_noop_when_empty(self):
+        adapter = self._adapter()
+        adapter._cardkit_sessions = {}
+        adapter._cardkit_open_by_chat = {}
+
+        await adapter._close_all_cardkit_sessions()
+
+        assert adapter._cardkit_sessions == {}
+        assert adapter._cardkit_open_by_chat == {}
+
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_cardkit_sessions_early(self, monkeypatch):
+        # thin disconnect coverage: patch the heavy websocket internals and
+        # assert open CardKit sessions are closed before websocket teardown.
+        adapter = self._adapter()
+        session = SimpleNamespace(
+            current_text="content",
+            close=AsyncMock(return_value=SendResult(success=True, message_id="msg_1")),
+        )
+        adapter._cardkit_sessions = {"msg_1": session}
+        adapter._cardkit_open_by_chat = {"chat_1": {"msg_1": session}}
+        adapter._running = True
+        adapter._pending_text_batch_tasks = {}
+        adapter._pending_media_batch_tasks = {}
+        adapter._ws_thread_loop = None
+        adapter._ws_future = None
+        adapter._client = object()
+        adapter._event_handler = None
+
+        monkeypatch.setattr(feishu_adapter, "FEISHU_AVAILABLE", True)
+        monkeypatch.setattr(adapter, "_cancel_pending_tasks", AsyncMock())
+        monkeypatch.setattr(adapter, "_reset_batch_buffers", lambda *a, **kw: None)
+        monkeypatch.setattr(adapter, "_disable_websocket_auto_reconnect", lambda *a, **kw: None)
+        monkeypatch.setattr(adapter, "_stop_webhook_server", AsyncMock())
+        monkeypatch.setattr(adapter, "_persist_seen_message_ids", lambda *a, **kw: None)
+        monkeypatch.setattr(adapter, "_release_app_lock", AsyncMock())
+        monkeypatch.setattr(adapter, "_mark_disconnected", lambda *a, **kw: None)
+
+        await adapter.disconnect()
+
+        session.close.assert_awaited_once_with("content")
+        assert adapter._cardkit_sessions == {}
+        assert adapter._cardkit_open_by_chat == {}
