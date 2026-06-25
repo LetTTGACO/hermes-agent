@@ -320,7 +320,9 @@ class TestFeishuStreamingCardSession:
     async def test_start_send_ref_failure(self):
         client = self._make_client_mock()
         send_ref = AsyncMock(
-            return_value=SendResult(success=False, error="send failed")
+            return_value=SendResult(
+                success=False, error="send failed", raw_response={"r": 1}
+            )
         )
         session = FeishuStreamingCardSession(
             client=client,
@@ -331,6 +333,47 @@ class TestFeishuStreamingCardSession:
 
         assert result.success is False
         assert session.card_id == "card_123"
+        # raw_response passthrough preserved on the failed result
+        assert result.raw_response == {"r": 1}
+        # best-effort close fires when the reference send fails
+        client.close_card.assert_awaited_once()
+        assert client.close_card.call_args.args[0] == "card_123"
+
+    @pytest.mark.asyncio
+    async def test_start_send_ref_raises_closes_card_and_propagates(self):
+        client = self._make_client_mock()
+        send_ref = AsyncMock(side_effect=RuntimeError("send boom"))
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        with pytest.raises(RuntimeError, match="send boom"):
+            await session.start("hello", reply_to=None, metadata=None)
+
+        # best-effort close fires even when the reference send raises, and the
+        # original exception propagates unchanged
+        client.close_card.assert_awaited_once()
+        assert client.close_card.call_args.args[0] == "card_123"
+
+    @pytest.mark.asyncio
+    async def test_start_send_ref_failure_close_error_is_swallowed(self):
+        # best-effort close must never mask the original reference-send failure
+        client = self._make_client_mock()
+        client.close_card = AsyncMock(side_effect=RuntimeError("close boom"))
+        send_ref = AsyncMock(
+            return_value=SendResult(success=False, error="send failed")
+        )
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.start("hello", reply_to=None, metadata=None)
+
+        assert result.success is False
+        assert result.error == "send failed"
+        client.close_card.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_start_initial_update_failure_closes_and_fails(self):

@@ -354,13 +354,25 @@ class FeishuStreamingCardSession:
             profile=self.profile,
         )
 
-        send_result = await self.send_card_reference(
-            card_id=self.card_id,
-            chat_id=self.chat_id,
-            reply_to=reply_to,
-            metadata=metadata,
-        )
+        try:
+            send_result = await self.send_card_reference(
+                card_id=self.card_id,
+                chat_id=self.chat_id,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        except Exception:
+            # Reference send raised: the card exists but has no chat message
+            # yet (self.message_id is still None), so self.close() cannot be
+            # used. Close the orphaned card best-effort, then re-raise.
+            await self._best_effort_close_created_card()
+            raise
+
         if not send_result.success:
+            # Reference send failed without raising: same orphaned-card
+            # situation. Close best-effort and propagate the failed result
+            # (preserving its raw_response).
+            await self._best_effort_close_created_card()
             return send_result
 
         self.message_id = send_result.message_id
@@ -454,6 +466,31 @@ class FeishuStreamingCardSession:
 
         self.closed = True
         return SendResult(success=True, message_id=self.message_id)
+
+    async def _best_effort_close_created_card(self) -> None:
+        """Best-effort close of a created card whose reference send failed.
+
+        Used from :meth:`start` when ``self.message_id`` is still ``None``
+        (so :meth:`close` cannot be used, since it requires an active
+        session).  Swallows close errors so the original reference-send
+        failure is never masked.
+        """
+        if not self.card_id:
+            return
+        self.sequence += 1
+        try:
+            await self.client.close_card(
+                self.card_id,
+                self.current_text,
+                self.sequence,
+            )
+        except Exception:
+            logger.debug(
+                "[Feishu] CardKit best-effort close failed for %s",
+                self.card_id,
+                exc_info=True,
+            )
+        self.closed = True
 
     async def _push_update(self, text: str, *, force: bool) -> None:
         """Push a text snapshot to the card element."""
