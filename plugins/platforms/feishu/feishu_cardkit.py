@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import json
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import SendResult
@@ -94,9 +95,10 @@ def _summary_for_content(content: str, *, streaming_mode: bool) -> str:
 
     Empty content yields "[Generating...]" when streaming, "" when static.
     """
-    visible = strip_streaming_cursor(content or "").strip()
-    if visible:
-        return truncate_summary(visible)
+    # build_card already strips the streaming cursor before calling us,
+    # so we use the content as-is here.
+    if content:
+        return truncate_summary(content)
     if streaming_mode:
         return "[Generating...]"
     return ""
@@ -141,3 +143,165 @@ def build_card(
             ]
         },
     }
+
+
+def _import_cardkit_sdk():
+    """Lazy-import CardKit SDK request/model classes.
+
+    Called only when CardKit is actually used, so the adapter's
+    import-time lark_oapi guard stays clean.
+    """
+    from lark_oapi.api.cardkit.v1 import (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+    )
+    return (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+    )
+
+
+class FeishuCardKitClient:
+    """Wraps lark_oapi CardKit API calls for card create/update/close."""
+
+    def __init__(self, sdk_client: Any):
+        self.sdk_client = sdk_client
+
+    @staticmethod
+    def _ensure_success(response: Any, action: str) -> None:
+        success = getattr(response, "success", None)
+        if callable(success) and success():
+            return
+        code = getattr(response, "code", None)
+        if code in (0, None) and not callable(success):
+            return
+        message = (
+            getattr(response, "msg", "")
+            or getattr(response, "message", "")
+            or "unknown error"
+        )
+        raise RuntimeError(f"Feishu CardKit {action} failed: {message}")
+
+    def _card_resource(self) -> Any:
+        return self.sdk_client.cardkit.v1.card
+
+    def _card_element_resource(self) -> Any:
+        return self.sdk_client.cardkit.v1.card_element
+
+    async def create_card(
+        self,
+        *,
+        content: str = "",
+        streaming_mode: bool = True,
+        profile: str = CARDKIT_ASSISTANT_PROFILE,
+    ) -> str:
+        """Create a streaming or static card; return the card_id."""
+        (
+            _,
+            _,
+            CreateCardRequest,
+            CreateCardRequestBody,
+            _,
+            _,
+        ) = _import_cardkit_sdk()
+
+        body = (
+            CreateCardRequestBody.builder()
+            .type("card_json")
+            .data(
+                json.dumps(
+                    build_card(
+                        content,
+                        streaming_mode=streaming_mode,
+                        profile=profile,
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            .build()
+        )
+        request = CreateCardRequest.builder().request_body(body).build()
+        response = await self._card_resource().acreate(request)
+        self._ensure_success(response, "create card")
+        card_id = getattr(getattr(response, "data", None), "card_id", None)
+        if not card_id:
+            raise RuntimeError(
+                "Feishu CardKit create card failed: missing card_id"
+            )
+        return str(card_id)
+
+    async def update_element_content(
+        self, card_id, element_id, content, sequence
+    ) -> None:
+        """Push an updated text payload to a card element."""
+        if len(content) > MAX_CARD_TEXT_LENGTH:
+            raise ValueError(
+                f"CardKit content exceeds {MAX_CARD_TEXT_LENGTH} characters"
+            )
+
+        (
+            ContentCardElementRequest,
+            ContentCardElementRequestBody,
+            _,
+            _,
+            _,
+            _,
+        ) = _import_cardkit_sdk()
+
+        body = (
+            ContentCardElementRequestBody.builder()
+            .content(content)
+            .sequence(sequence)
+            .uuid(f"s_{card_id}_{sequence}")
+            .build()
+        )
+        request = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(element_id)
+            .request_body(body)
+            .build()
+        )
+        response = await self._card_element_resource().acontent(request)
+        self._ensure_success(response, "update card")
+
+    async def close_card(self, card_id, final_text, sequence) -> None:
+        """Close a streaming card with a final summary."""
+        (
+            _,
+            _,
+            _,
+            _,
+            SettingsCardRequest,
+            SettingsCardRequestBody,
+        ) = _import_cardkit_sdk()
+
+        settings = {
+            "config": {
+                "streaming_mode": False,
+                "summary": {"content": truncate_summary(final_text)},
+            }
+        }
+        body = (
+            SettingsCardRequestBody.builder()
+            .settings(json.dumps(settings, ensure_ascii=False))
+            .sequence(sequence)
+            .uuid(f"c_{card_id}_{sequence}")
+            .build()
+        )
+        request = (
+            SettingsCardRequest.builder()
+            .card_id(card_id)
+            .request_body(body)
+            .build()
+        )
+        response = await self._card_resource().asettings(request)
+        self._ensure_success(response, "close card")

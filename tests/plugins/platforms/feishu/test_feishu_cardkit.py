@@ -1,7 +1,11 @@
 """Tests for Feishu CardKit helper module."""
 
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from plugins.platforms.feishu.feishu_cardkit import (
+    FeishuCardKitClient,
     build_card,
     strip_streaming_cursor,
     merge_streaming_text,
@@ -12,6 +16,140 @@ from plugins.platforms.feishu.feishu_cardkit import (
     CARDKIT_TOOL_PROGRESS_PROFILE,
     CARDKIT_STATIC_PROFILE,
 )
+
+
+def _mock_builders():
+    """Return a 6-tuple of MagicMock builder classes for _import_cardkit_sdk."""
+    return tuple(MagicMock() for _ in range(6))
+
+
+class TestFeishuCardKitClient:
+    def _make_sdk_client(self):
+        """Create a mock SDK client with cardkit.v1 chain."""
+        client = MagicMock()
+        card_resource = MagicMock()
+        card_element_resource = MagicMock()
+        client.cardkit.v1.card = card_resource
+        client.cardkit.v1.card_element = card_element_resource
+        return client, card_resource, card_element_resource
+
+    @pytest.mark.asyncio
+    async def test_create_card_streaming(self):
+        sdk_client, card_resource, _ = self._make_sdk_client()
+        response = MagicMock()
+        response.success.return_value = True
+        response.code = 0
+        response.data.card_id = "card_123"
+        card_resource.acreate = AsyncMock(return_value=response)
+
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            client = FeishuCardKitClient(sdk_client)
+            card_id = await client.create_card(
+                content="hello", streaming_mode=True, profile=CARDKIT_ASSISTANT_PROFILE
+            )
+        assert card_id == "card_123"
+        card_resource.acreate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_card_static(self):
+        sdk_client, card_resource, _ = self._make_sdk_client()
+        response = MagicMock()
+        response.success.return_value = True
+        response.code = 0
+        response.data.card_id = "card_456"
+        card_resource.acreate = AsyncMock(return_value=response)
+
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            client = FeishuCardKitClient(sdk_client)
+            card_id = await client.create_card(
+                content="final text", streaming_mode=False, profile=CARDKIT_STATIC_PROFILE
+            )
+        assert card_id == "card_456"
+
+    @pytest.mark.asyncio
+    async def test_create_card_missing_card_id(self):
+        sdk_client, card_resource, _ = self._make_sdk_client()
+        response = MagicMock()
+        response.success.return_value = True
+        response.code = 0
+        response.data.card_id = None
+        card_resource.acreate = AsyncMock(return_value=response)
+
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            client = FeishuCardKitClient(sdk_client)
+            with pytest.raises(RuntimeError, match="missing card_id"):
+                await client.create_card(content="hello", streaming_mode=True)
+
+    @pytest.mark.asyncio
+    async def test_create_card_api_failure(self):
+        sdk_client, card_resource, _ = self._make_sdk_client()
+        response = MagicMock()
+        response.success.return_value = False
+        response.code = 999
+        response.msg = "permission denied"
+        card_resource.acreate = AsyncMock(return_value=response)
+
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            client = FeishuCardKitClient(sdk_client)
+            with pytest.raises(RuntimeError, match="permission denied"):
+                await client.create_card(content="hello", streaming_mode=True)
+
+    @pytest.mark.asyncio
+    async def test_update_element_content(self):
+        sdk_client, _, card_element_resource = self._make_sdk_client()
+        response = MagicMock()
+        response.success.return_value = True
+        response.code = 0
+        card_element_resource.acontent = AsyncMock(return_value=response)
+
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            client = FeishuCardKitClient(sdk_client)
+            await client.update_element_content("card_123", "content", "hello world", 2)
+        card_element_resource.acontent.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_element_content_over_limit(self):
+        sdk_client, _, card_element_resource = self._make_sdk_client()
+        client = FeishuCardKitClient(sdk_client)
+        long_text = "a" * (MAX_CARD_TEXT_LENGTH + 1)
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            with pytest.raises(ValueError, match="exceeds"):
+                await client.update_element_content("card_123", "content", long_text, 2)
+        card_element_resource.acontent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_card(self):
+        sdk_client, card_resource, _ = self._make_sdk_client()
+        response = MagicMock()
+        response.success.return_value = True
+        response.code = 0
+        card_resource.asettings = AsyncMock(return_value=response)
+
+        with patch(
+            "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
+            return_value=_mock_builders(),
+        ):
+            client = FeishuCardKitClient(sdk_client)
+            await client.close_card("card_123", "final text", 5)
+        card_resource.asettings.assert_called_once()
 
 
 class TestStripStreamingCursor:
