@@ -15426,6 +15426,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
             else None
         )
+        _progress_send_metadata = _progress_metadata
+        if source.platform == Platform.FEISHU:
+            _progress_send_metadata = dict(_progress_metadata or {})
+            _progress_send_metadata["message_kind"] = "tool_progress"
 
         async def send_progress_messages():
             if not progress_queue:
@@ -15471,7 +15475,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Detect whether the adapter's edit_message accepts metadata so
             # overflow edits preserve Telegram topic/thread routing (#27487).
             _edit_accepts_metadata = False
-            if _progress_metadata:
+            if _progress_send_metadata:
                 try:
                     _edit_params = inspect.signature(adapter.edit_message).parameters
                     _edit_accepts_metadata = (
@@ -15493,7 +15497,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
                     kwargs["finalize"] = True
                 if _edit_accepts_metadata:
-                    kwargs["metadata"] = _progress_metadata
+                    kwargs["metadata"] = _progress_send_metadata
                 return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:
@@ -15527,7 +15531,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=source.chat_id,
                     content=text,
                     reply_to=_progress_reply_to,
-                    metadata=_progress_metadata,
+                    metadata=_progress_send_metadata,
                 )
                 _track_progress_result(result)
                 return result
@@ -15674,7 +15678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_send_metadata,
                             )
                             if (
                                 _cleanup_progress
@@ -15690,7 +15694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=full_text,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_send_metadata,
                             )
                         else:
                             # Editing unsupported: send just this line
@@ -15698,7 +15702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_send_metadata,
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
