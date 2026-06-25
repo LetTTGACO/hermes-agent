@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from plugins.platforms.feishu.feishu_cardkit import (
     FeishuCardKitClient,
+    FeishuStreamingCardSession,
     build_card,
     strip_streaming_cursor,
     merge_streaming_text,
@@ -16,6 +17,7 @@ from plugins.platforms.feishu.feishu_cardkit import (
     CARDKIT_TOOL_PROGRESS_PROFILE,
     CARDKIT_STATIC_PROFILE,
 )
+from gateway.platforms.base import SendResult
 
 
 def _mock_builders():
@@ -243,3 +245,195 @@ class TestBuildCard:
         content = "Some visible text here"
         card = build_card(content, streaming_mode=True, profile=CARDKIT_ASSISTANT_PROFILE)
         assert card["config"]["summary"]["content"] == content
+
+
+class TestFeishuStreamingCardSession:
+    """Tests for FeishuStreamingCardSession lifecycle management."""
+
+    def _make_client_mock(self):
+        client = MagicMock()
+        client.create_card = AsyncMock(return_value="card_123")
+        client.update_element_content = AsyncMock(return_value=None)
+        client.close_card = AsyncMock(return_value=None)
+        return client
+
+    def _make_send_ref_mock(self, message_id="om_abc"):
+        send_ref = AsyncMock(return_value=SendResult(success=True, message_id=message_id))
+        return send_ref
+
+    @pytest.mark.asyncio
+    async def test_start_creates_card_and_sends_reference(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.start("hello", reply_to="om_reply", metadata={"k": "v"})
+
+        assert result.success is True
+        assert result.message_id == "om_abc"
+        assert session.card_id == "card_123"
+        assert session.message_id == "om_abc"
+        client.create_card.assert_called_once()
+        send_ref.assert_called_once()
+        assert send_ref.call_args.kwargs["card_id"] == "card_123"
+        assert send_ref.call_args.kwargs["chat_id"] == "oc_test"
+        assert send_ref.call_args.kwargs["reply_to"] == "om_reply"
+        assert send_ref.call_args.kwargs["metadata"] == {"k": "v"}
+
+    @pytest.mark.asyncio
+    async def test_start_with_initial_text_pushes_update(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.start("hello world", reply_to=None, metadata=None)
+
+        assert result.success is True
+        assert session.current_text == "hello world"
+        client.update_element_content.assert_called_once()
+        call_args = client.update_element_content.call_args
+        assert call_args.args[0] == "card_123"
+        assert call_args.args[1] == CARD_CONTENT_ELEMENT_ID
+        assert call_args.args[2] == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_start_empty_text_skips_update(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.start("", reply_to=None, metadata=None)
+
+        assert result.success is True
+        client.update_element_content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_send_ref_failure(self):
+        client = self._make_client_mock()
+        send_ref = AsyncMock(
+            return_value=SendResult(success=False, error="send failed")
+        )
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.start("hello", reply_to=None, metadata=None)
+
+        assert result.success is False
+        assert session.card_id == "card_123"
+
+    @pytest.mark.asyncio
+    async def test_start_initial_update_failure_closes_and_fails(self):
+        client = self._make_client_mock()
+        client.update_element_content = AsyncMock(side_effect=RuntimeError("update failed"))
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.start("hello", reply_to=None, metadata=None)
+
+        assert result.success is False
+        client.close_card.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_pushes_merged_text(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        await session.start("hello", reply_to=None, metadata=None)
+
+        # Reset mock to isolate the update call
+        client.update_element_content.reset_mock()
+        result = await session.update("hello world")
+
+        assert result.success is True
+        client.update_element_content.assert_called_once()
+        call_args = client.update_element_content.call_args
+        assert call_args.args[2] == "hello world"
+        assert session.current_text == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_update_same_text_noop(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        await session.start("hello", reply_to=None, metadata=None)
+
+        client.update_element_content.reset_mock()
+        result = await session.update("hello")
+
+        assert result.success is True
+        client.update_element_content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_pushes_final_and_closes(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        await session.start("hello", reply_to=None, metadata=None)
+
+        client.update_element_content.reset_mock()
+        client.close_card.reset_mock()
+        result = await session.close("hello world")
+
+        assert result.success is True
+        assert session.closed is True
+        # Final update pushed because merged text differs from current
+        client.update_element_content.assert_called_once()
+        client.close_card.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_close_already_closed(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        await session.start("hello", reply_to=None, metadata=None)
+
+        await session.close("hello world")
+        client.close_card.reset_mock()
+        result = await session.close("hello world again")
+
+        assert result.success is True
+        client.close_card.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_without_active_session(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        result = await session.close("hello world")
+
+        assert result.success is False
+        client.close_card.assert_not_called()
