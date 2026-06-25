@@ -1990,12 +1990,43 @@ class FeishuAdapter(BasePlatformAdapter):
             streaming_mode=False,
             profile=CARDKIT_STATIC_PROFILE,
         )
-        return await self._send_cardkit_reference(
-            card_id=card_id,
-            chat_id=chat_id,
-            reply_to=reply_to,
-            metadata=metadata,
-        )
+        try:
+            reference_result = await self._send_cardkit_reference(
+                card_id=card_id,
+                chat_id=chat_id,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        except Exception:
+            # Reference send raised: close the orphaned card best-effort,
+            # then re-raise so callers see the original failure.
+            await self._best_effort_close_card(cardkit_client, card_id, content)
+            raise
+        if not reference_result.success:
+            # Reference send failed without raising: close best-effort and
+            # propagate the failed result (preserving its raw_response).
+            await self._best_effort_close_card(cardkit_client, card_id, content)
+            return reference_result
+        return reference_result
+
+    async def _best_effort_close_card(
+        self,
+        cardkit_client: Any,
+        card_id: str,
+        content: str,
+    ) -> None:
+        """Best-effort close of a created CardKit card whose reference send failed.
+
+        Swallows close errors so the original failure is never masked.
+        """
+        try:
+            await cardkit_client.close_card(card_id, content, 1)
+        except Exception:
+            logger.debug(
+                "[Feishu] CardKit best-effort close failed for %s",
+                card_id,
+                exc_info=True,
+            )
 
     async def _send_streaming_cardkit(
         self,

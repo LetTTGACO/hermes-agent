@@ -3,7 +3,7 @@
 import json
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from gateway.platforms.base import SendResult
@@ -470,6 +470,90 @@ class TestCardkitSendHelpers:
         assert adapter._cardkit_open_by_chat == {
             "chat_1": {"stream_msg": session}
         }
+
+    @pytest.mark.asyncio
+    async def test_send_static_cardkit_closes_card_when_reference_fails(self, monkeypatch):
+        adapter = self._adapter()
+        monkeypatch.setattr(adapter, "_close_cardkit_siblings", AsyncMock())
+        cardkit_client = MagicMock()
+        cardkit_client.create_card = AsyncMock(return_value="card_static")
+        cardkit_client.close_card = AsyncMock(return_value=None)
+        failed = SendResult(success=False, error="ref failed", raw_response={"r": 1})
+        monkeypatch.setattr(
+            adapter,
+            "_send_cardkit_reference",
+            AsyncMock(return_value=failed),
+        )
+
+        result = await adapter._send_static_cardkit(
+            cardkit_client,
+            "chat_1",
+            "hello",
+            reply_to=None,
+            metadata=None,
+        )
+
+        assert result is failed
+        cardkit_client.create_card.assert_awaited_once()
+        # best-effort close fires when the reference send fails
+        cardkit_client.close_card.assert_awaited_once()
+        assert cardkit_client.close_card.call_args.args[0] == "card_static"
+        assert cardkit_client.close_card.call_args.args[1] == "hello"
+        assert cardkit_client.close_card.call_args.args[2] == 1
+
+    @pytest.mark.asyncio
+    async def test_send_static_cardkit_closes_card_when_reference_raises(self, monkeypatch):
+        adapter = self._adapter()
+        monkeypatch.setattr(adapter, "_close_cardkit_siblings", AsyncMock())
+        cardkit_client = MagicMock()
+        cardkit_client.create_card = AsyncMock(return_value="card_static")
+        cardkit_client.close_card = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            adapter,
+            "_send_cardkit_reference",
+            AsyncMock(side_effect=RuntimeError("ref boom")),
+        )
+
+        with pytest.raises(RuntimeError, match="ref boom"):
+            await adapter._send_static_cardkit(
+                cardkit_client,
+                "chat_1",
+                "hello",
+                reply_to=None,
+                metadata=None,
+            )
+
+        cardkit_client.create_card.assert_awaited_once()
+        # best-effort close fires even when the reference send raises, and the
+        # original exception propagates unchanged
+        cardkit_client.close_card.assert_awaited_once()
+        assert cardkit_client.close_card.call_args.args[0] == "card_static"
+
+    @pytest.mark.asyncio
+    async def test_send_static_cardkit_close_error_is_swallowed(self, monkeypatch):
+        # best-effort close must never mask the original reference-send failure
+        adapter = self._adapter()
+        monkeypatch.setattr(adapter, "_close_cardkit_siblings", AsyncMock())
+        cardkit_client = MagicMock()
+        cardkit_client.create_card = AsyncMock(return_value="card_static")
+        cardkit_client.close_card = AsyncMock(side_effect=RuntimeError("close boom"))
+        monkeypatch.setattr(
+            adapter,
+            "_send_cardkit_reference",
+            AsyncMock(return_value=SendResult(success=False, error="ref failed")),
+        )
+
+        result = await adapter._send_static_cardkit(
+            cardkit_client,
+            "chat_1",
+            "hello",
+            reply_to=None,
+            metadata=None,
+        )
+
+        assert result.success is False
+        assert result.error == "ref failed"
+        cardkit_client.close_card.assert_awaited_once()
 
 
 class TestEditMessageCardkit:
