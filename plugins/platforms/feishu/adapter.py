@@ -175,6 +175,11 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+# CardKit create and IM's card_id index are eventually consistent: a reference
+# sent right after create can be rejected with code 230099 / ext 11310
+# ("cardid is invalid") because IM hasn't indexed the new card yet. Match
+# narrowly so we only retry this transient mismatch, not other 230099 causes.
+_CARDKIT_CARDID_INVALID_RE = re.compile(r"cardid is invalid|ErrCode:\s*11310", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -203,6 +208,10 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
+# Short backoff for retrying a freshly-created CardKit card reference when IM
+# hasn't yet indexed the new card_id (230099 / 11310). Replaces a blanket
+# pre-send sleep — only paid when the transient mismatch actually occurs.
+_CARDKIT_REFERENCE_BACKOFF_SECONDS = (0.2, 0.5, 1.0)
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -1920,6 +1929,19 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    @staticmethod
+    def _is_cardkit_cardid_invalid(response: Any) -> bool:
+        """True when IM rejected a card reference because its card_id index
+        hasn't caught up with CardKit yet (code 230099 / ext 11310,
+        "cardid is invalid"). Transient — retried with a short backoff.
+        """
+        if FeishuAdapter._response_succeeded(response):
+            return False
+        if str(getattr(response, "code", "")) != "230099":
+            return False
+        msg = str(getattr(response, "msg", "") or "")
+        return bool(_CARDKIT_CARDID_INVALID_RE.search(msg))
+
     async def _send_cardkit_reference(
         self,
         card_id: str,
@@ -1931,13 +1953,34 @@ class FeishuAdapter(BasePlatformAdapter):
             {"type": "card", "data": {"card_id": card_id}},
             ensure_ascii=False,
         )
-        response = await self._feishu_send_with_retry(
-            chat_id=chat_id,
-            msg_type="interactive",
-            payload=payload,
-            reply_to=reply_to,
-            metadata=metadata,
-        )
+        # CardKit create and IM's card_id index are eventually consistent: a
+        # reference sent immediately after create may be rejected with 230099 /
+        # 11310 ("cardid is invalid"). Retry the same card_id with a short
+        # backoff instead of sleeping unconditionally before every send.
+        backoffs = _CARDKIT_REFERENCE_BACKOFF_SECONDS
+        response: Any = None
+        for attempt in range(len(backoffs) + 1):
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if self._response_succeeded(response) or not self._is_cardkit_cardid_invalid(response):
+                return self._finalize_send_result(response, "cardkit send failed")
+            if attempt < len(backoffs):
+                backoff = backoffs[attempt]
+                logger.warning(
+                    "[Feishu] CardKit card_id %s not yet indexed by IM (code %s); "
+                    "retrying reference send in %ss (attempt %d/%d)",
+                    card_id,
+                    getattr(response, "code", None),
+                    backoff,
+                    attempt + 1,
+                    len(backoffs),
+                )
+                await asyncio.sleep(backoff)
         return self._finalize_send_result(response, "cardkit send failed")
 
     async def _close_cardkit_siblings(self, chat_id: str) -> None:

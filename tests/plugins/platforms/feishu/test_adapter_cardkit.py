@@ -420,6 +420,52 @@ class TestCardkitSendHelpers:
         assert finalize_calls == [(response, "cardkit send failed")]
 
     @pytest.mark.asyncio
+    async def test_send_cardkit_reference_retries_transient_cardid_invalid(self, monkeypatch):
+        adapter = self._adapter()
+        invalid = SimpleNamespace(
+            success=lambda: False,
+            code=230099,
+            msg="Failed to create card content, ext=ErrCode: 11310; ErrMsg: cardid is invalid;",
+        )
+        ok = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_1"))
+        send_with_retry = AsyncMock(side_effect=[invalid, invalid, ok])
+        sleeps: list[float] = []
+        monkeypatch.setattr(feishu_adapter.asyncio, "sleep", AsyncMock(side_effect=lambda s: sleeps.append(s)))
+        finalized = SendResult(success=True, message_id="msg_1", raw_response=ok)
+        monkeypatch.setattr(adapter, "_feishu_send_with_retry", send_with_retry)
+        monkeypatch.setattr(adapter, "_finalize_send_result", lambda resp, default_message: finalized)
+
+        result = await adapter._send_cardkit_reference(
+            card_id="card_1", chat_id="chat_1", reply_to=None, metadata=None
+        )
+
+        assert result is finalized
+        assert send_with_retry.await_count == 3
+        # backoff schedule (0.2, 0.5, 1.0) — two retries before the successful third send
+        assert sleeps == [0.2, 0.5]
+
+    @pytest.mark.asyncio
+    async def test_send_cardkit_reference_does_not_retry_non_cardid_failure(self, monkeypatch):
+        adapter = self._adapter()
+        other = SimpleNamespace(
+            success=lambda: False,
+            code=230002,
+            msg="some other card content error",
+        )
+        send_with_retry = AsyncMock(return_value=other)
+        monkeypatch.setattr(feishu_adapter.asyncio, "sleep", AsyncMock())
+        finalized = SendResult(success=False, error="[230002] boom", raw_response=other)
+        monkeypatch.setattr(adapter, "_feishu_send_with_retry", send_with_retry)
+        monkeypatch.setattr(adapter, "_finalize_send_result", lambda resp, default_message: finalized)
+
+        result = await adapter._send_cardkit_reference(
+            card_id="card_1", chat_id="chat_1", reply_to=None, metadata=None
+        )
+
+        assert result is finalized
+        send_with_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_send_streaming_cardkit_registers_successful_session(self, monkeypatch):
         adapter = self._adapter()
         close_siblings = AsyncMock()
