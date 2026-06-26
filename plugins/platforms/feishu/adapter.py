@@ -211,7 +211,11 @@ _FEISHU_SEND_ATTEMPTS = 3
 # Short backoff for retrying a freshly-created CardKit card reference when IM
 # hasn't yet indexed the new card_id (230099 / 11310). Replaces a blanket
 # pre-send sleep — only paid when the transient mismatch actually occurs.
-_CARDKIT_REFERENCE_BACKOFF_SECONDS = (0.2, 0.5, 1.0)
+# IM's card_id index typically lags CardKit create by a few hundred ms, so a
+# reference sent at 0s almost always misses — front-load a short initial wait
+# to land the first attempt, then escalate if still not indexed.
+_CARDKIT_REFERENCE_INITIAL_DELAY_SECONDS = 0.3
+_CARDKIT_REFERENCE_BACKOFF_SECONDS = (0.5, 1.0)
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -1955,8 +1959,10 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         # CardKit create and IM's card_id index are eventually consistent: a
         # reference sent immediately after create may be rejected with 230099 /
-        # 11310 ("cardid is invalid"). Retry the same card_id with a short
-        # backoff instead of sleeping unconditionally before every send.
+        # 11310 ("cardid is invalid"). Wait briefly up front so the first
+        # attempt usually lands, then retry with escalating backoff if IM is
+        # still propagating the new card_id.
+        await asyncio.sleep(_CARDKIT_REFERENCE_INITIAL_DELAY_SECONDS)
         backoffs = _CARDKIT_REFERENCE_BACKOFF_SECONDS
         response: Any = None
         for attempt in range(len(backoffs) + 1):

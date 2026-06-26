@@ -441,8 +441,9 @@ class TestCardkitSendHelpers:
 
         assert result is finalized
         assert send_with_retry.await_count == 3
-        # backoff schedule (0.2, 0.5, 1.0) — two retries before the successful third send
-        assert sleeps == [0.2, 0.5]
+        # 0.3s initial wait before the first attempt, then (0.5, 1.0) backoff
+        # across two retries before the successful third send
+        assert sleeps == [0.3, 0.5, 1.0]
 
     @pytest.mark.asyncio
     async def test_send_cardkit_reference_does_not_retry_non_cardid_failure(self, monkeypatch):
