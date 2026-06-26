@@ -104,6 +104,11 @@ def _reply_anchor_for_event(event) -> str | None:
         return None
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
+    # Feishu p2p (DM): drop the reply anchor. Replying to the triggering
+    # message makes every bot turn render as a quoted reply in the client,
+    # which is noisy in 1:1 chats. Group/topic behavior is unchanged.
+    if platform == "feishu" and getattr(source, "chat_type", None) == "dm":
+        return None
     return getattr(event, "message_id", None)
 
 
