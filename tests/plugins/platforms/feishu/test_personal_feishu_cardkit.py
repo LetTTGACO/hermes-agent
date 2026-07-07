@@ -1,4 +1,4 @@
-"""Tests for Feishu CardKit helper module."""
+"""Personal fork tests for Feishu CardKit helper module."""
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch

@@ -26,6 +26,7 @@ class TestResolveCdpOverride:
 
         assert resolved == WS_URL
         mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+
     def test_resolves_bare_ws_hostport_to_discovery_websocket(self):
         from tools.browser_tool import _resolve_cdp_override
 

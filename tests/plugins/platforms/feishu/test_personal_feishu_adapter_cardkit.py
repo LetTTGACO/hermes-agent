@@ -1,4 +1,4 @@
-"""Tests for Feishu adapter CardKit integration helpers."""
+"""Personal fork tests for Feishu adapter CardKit integration helpers."""
 
 import json
 import sys
