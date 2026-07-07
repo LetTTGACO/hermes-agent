@@ -849,6 +849,7 @@ class TestDisconnectCardkitCleanup:
         adapter._running = True
         adapter._pending_text_batch_tasks = {}
         adapter._pending_media_batch_tasks = {}
+        adapter._ws_client = None
         adapter._ws_thread_loop = None
         adapter._ws_future = None
         adapter._client = object()
