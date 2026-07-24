@@ -53,16 +53,19 @@ def strip_streaming_cursor(text: str) -> str:
 def merge_streaming_text(
     previous_text: Optional[str], next_text: Optional[str]
 ) -> str:
-    """Merge two chunks of streaming text, handling overlap.
+    """Reconcile two full-text streaming snapshots.
 
     - If *next_text* starts with *previous_text*, *next_text* is the newer
       full snapshot -> return it.
     - If *previous_text* starts with *next_text*, the previous snapshot is
-      longer -> return it.
-    - If *previous_text* ends with *next_text*, the previous snapshot already
-      contains the new chunk -> return it.
-    - Otherwise find the longest suffix/prefix overlap and join on it.
-    - If none of the above, concatenate.
+      longer, so treat *next_text* as a stale update -> return *previous_text*.
+    - Otherwise *next_text* is a reformatted snapshot -> return it unchanged.
+
+    ``GatewayStreamConsumer`` already accumulates model deltas before calling
+    ``adapter.edit_message()``. It may also temporarily balance incomplete
+    Markdown between edits, so consecutive snapshots do not always have a
+    prefix relationship. Concatenating those snapshots would duplicate all
+    content carried by the newer one.
     """
     previous = previous_text or ""
     next_value = next_text or ""
@@ -74,13 +77,7 @@ def merge_streaming_text(
         return next_value
     if previous.startswith(next_value):
         return previous
-    if previous.endswith(next_value):
-        return previous
-    max_overlap = min(len(previous), len(next_value))
-    for overlap in range(max_overlap, 0, -1):
-        if previous.endswith(next_value[:overlap]):
-            return previous + next_value[overlap:]
-    return previous + next_value
+    return next_value
 
 
 def truncate_summary(text: str, max_chars: int = 50) -> str:

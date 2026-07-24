@@ -18,6 +18,7 @@ from plugins.platforms.feishu.feishu_cardkit import (
     CARDKIT_STATIC_PROFILE,
 )
 from gateway.platforms.base import SendResult
+from gateway.stream_consumer import ensure_closed_code_fences
 
 
 def _mock_builders():
@@ -175,11 +176,11 @@ class TestMergeStreamingText:
     def test_previous_contains_next(self):
         assert merge_streaming_text("hello world", "hello") == "hello world"
 
-    def test_no_overlap(self):
-        assert merge_streaming_text("hello", "world") == "helloworld"
+    def test_reformatted_snapshot_replaces_previous(self):
+        assert merge_streaming_text("hello", "world") == "world"
 
-    def test_overlap(self):
-        assert merge_streaming_text("hello wor", "world") == "hello world"
+    def test_partial_overlap_does_not_concatenate_snapshots(self):
+        assert merge_streaming_text("hello wor", "world") == "world"
 
     def test_empty_previous(self):
         assert merge_streaming_text("", "hello") == "hello"
@@ -410,6 +411,39 @@ class TestFeishuStreamingCardSession:
         call_args = client.update_element_content.call_args
         assert call_args.args[2] == "hello world"
         assert session.current_text == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_update_replaces_reformatted_full_snapshot_without_duplication(self):
+        client = self._make_client_mock()
+        send_ref = self._make_send_ref_mock()
+        session = FeishuStreamingCardSession(
+            client=client,
+            chat_id="oc_test",
+            send_card_reference=send_ref,
+        )
+        await session.start("", reply_to=None, metadata=None)
+
+        # GatewayStreamConsumer passes full snapshots to edit_message(). While
+        # streaming, it may append a synthetic backtick after the cursor to
+        # balance incomplete Markdown. The next, longer snapshot then no longer
+        # has the prior rendered frame as a prefix.
+        partial = "前言\n\n## 模型对比\n\n`GLM"
+        partial_frame = ensure_closed_code_fences(partial + " ▉")
+        complete = (
+            "前言\n\n## 模型对比\n\n"
+            "`GLM-5.2` vs `Doubao-Seed-2.1-Turbo`\n\n"
+            "| 模型 | 特点 |\n| --- | --- |\n| GLM-5.2 | 长文本 |"
+        )
+        complete_frame = ensure_closed_code_fences(complete + " ▉")
+
+        await session.update(partial_frame)
+        await session.update(complete_frame)
+
+        partial_visible = strip_streaming_cursor(partial_frame)
+        expected = strip_streaming_cursor(complete_frame)
+        assert not expected.startswith(partial_visible)
+        assert session.current_text == expected
+        assert client.update_element_content.await_args_list[-1].args[2] == expected
 
     @pytest.mark.asyncio
     async def test_update_same_text_noop(self):
