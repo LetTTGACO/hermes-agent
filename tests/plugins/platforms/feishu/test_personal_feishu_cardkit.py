@@ -9,7 +9,6 @@ from plugins.platforms.feishu.feishu_cardkit import (
     FeishuStreamingCardSession,
     build_card,
     strip_streaming_cursor,
-    merge_streaming_text,
     truncate_summary,
     CARD_CONTENT_ELEMENT_ID,
     MAX_CARD_TEXT_LENGTH,
@@ -167,32 +166,6 @@ class TestStripStreamingCursor:
 
     def test_empty_string(self):
         assert strip_streaming_cursor("") == ""
-
-
-class TestMergeStreamingText:
-    def test_next_extends_previous(self):
-        assert merge_streaming_text("hello", "hello world") == "hello world"
-
-    def test_previous_contains_next(self):
-        assert merge_streaming_text("hello world", "hello") == "hello world"
-
-    def test_reformatted_snapshot_replaces_previous(self):
-        assert merge_streaming_text("hello", "world") == "world"
-
-    def test_partial_overlap_does_not_concatenate_snapshots(self):
-        assert merge_streaming_text("hello wor", "world") == "world"
-
-    def test_empty_previous(self):
-        assert merge_streaming_text("", "hello") == "hello"
-
-    def test_empty_next(self):
-        assert merge_streaming_text("hello", "") == "hello"
-
-    def test_none_previous(self):
-        assert merge_streaming_text(None, "hello") == "hello"
-
-    def test_none_next(self):
-        assert merge_streaming_text("hello", None) == "hello"
 
 
 class TestTruncateSummary:

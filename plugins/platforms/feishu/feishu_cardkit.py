@@ -50,36 +50,6 @@ def strip_streaming_cursor(text: str) -> str:
     return text
 
 
-def merge_streaming_text(
-    previous_text: Optional[str], next_text: Optional[str]
-) -> str:
-    """Reconcile two full-text streaming snapshots.
-
-    - If *next_text* starts with *previous_text*, *next_text* is the newer
-      full snapshot -> return it.
-    - If *previous_text* starts with *next_text*, the previous snapshot is
-      longer, so treat *next_text* as a stale update -> return *previous_text*.
-    - Otherwise *next_text* is a reformatted snapshot -> return it unchanged.
-
-    ``GatewayStreamConsumer`` already accumulates model deltas before calling
-    ``adapter.edit_message()``. It may also temporarily balance incomplete
-    Markdown between edits, so consecutive snapshots do not always have a
-    prefix relationship. Concatenating those snapshots would duplicate all
-    content carried by the newer one.
-    """
-    previous = previous_text or ""
-    next_value = next_text or ""
-    if not previous:
-        return next_value
-    if not next_value:
-        return previous
-    if next_value.startswith(previous):
-        return next_value
-    if previous.startswith(next_value):
-        return previous
-    return next_value
-
-
 def truncate_summary(text: str, max_chars: int = 50) -> str:
     """Truncate *text* to at most *max_chars* characters."""
     if len(text) <= max_chars:
@@ -399,15 +369,11 @@ class FeishuStreamingCardSession:
         )
 
     async def update(self, text: str) -> SendResult:
-        """Push a merged full-text snapshot to the card."""
+        """Push a full-text snapshot to the card."""
         if self.closed or not self.card_id or not self.message_id:
             return SendResult(success=False, error="CardKit session is not active")
 
-        visible_text = strip_streaming_cursor(text)
-        if self.profile == CARDKIT_TOOL_PROGRESS_PROFILE:
-            next_text = visible_text
-        else:
-            next_text = merge_streaming_text(self.current_text, visible_text)
+        next_text = strip_streaming_cursor(text)
 
         if not next_text or next_text == self.current_text:
             return SendResult(success=True, message_id=self.message_id)
@@ -423,9 +389,8 @@ class FeishuStreamingCardSession:
         if not self.card_id or not self.message_id:
             return SendResult(success=False, error="CardKit session is not active")
 
-        merged = self.current_text
-        if final_text:
-            merged = merge_streaming_text(merged, strip_streaming_cursor(final_text))
+        final_snapshot = strip_streaming_cursor(final_text) if final_text else ""
+        merged = final_snapshot or self.current_text
 
         if merged and merged != self.current_text:
             try:
