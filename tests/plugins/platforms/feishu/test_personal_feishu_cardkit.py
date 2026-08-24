@@ -1,11 +1,12 @@
 """Personal fork tests for Feishu CardKit helper module."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from plugins.platforms.feishu.feishu_cardkit import (
     FeishuCardKitClient,
+    FeishuCardKitRuntime,
     FeishuStreamingCardSession,
     build_card,
     strip_streaming_cursor,
@@ -487,3 +488,172 @@ class TestFeishuStreamingCardSession:
 
         assert result.success is False
         client.close_card.assert_not_called()
+
+
+def _runtime_client():
+    client = MagicMock()
+    client.create_card = AsyncMock(side_effect=["card-progress", "card-final"])
+    client.update_element_content = AsyncMock(return_value=None)
+    client.close_card = AsyncMock(return_value=None)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_latest_complete_snapshot_without_duplication():
+    client = _runtime_client()
+    send_reference = AsyncMock(
+        return_value=SendResult(success=True, message_id="om-assistant")
+    )
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+
+    sent = await runtime.try_send(
+        "oc_chat", "# Title\nfirst", reply_to=None, metadata={"expect_edits": True}
+    )
+    edited = await runtime.edit_if_managed(
+        "oc_chat", sent.message_id, "# Title\nfirst\nsecond", finalize=False
+    )
+
+    assert edited.success is True
+    assert client.update_element_content.await_args_list[-1].args[2] == (
+        "# Title\nfirst\nsecond"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_tool_progress_finalize_updates_until_next_card_closes_it():
+    client = _runtime_client()
+    send_reference = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="om-progress"),
+            SendResult(success=True, message_id="om-final"),
+        ]
+    )
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+
+    progress = await runtime.try_send(
+        "oc_chat", "running", reply_to=None,
+        metadata={"message_kind": "tool_progress"},
+    )
+    update = await runtime.edit_if_managed(
+        "oc_chat", progress.message_id, "running tool 2", finalize=True
+    )
+    assert update.success is True
+    client.close_card.assert_not_awaited()
+
+    final = await runtime.try_send(
+        "oc_chat", "done", reply_to=None, metadata=None
+    )
+    assert final.success is True
+    client.close_card.assert_awaited_once()
+    assert await runtime.edit_if_managed(
+        "oc_chat", progress.message_id, "late", finalize=False
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_retries_only_cardid_invalid_reference(monkeypatch):
+    client = _runtime_client()
+    invalid = MagicMock(code=230099, msg="ErrCode: 11310 cardid is invalid")
+    send_reference = AsyncMock(side_effect=[
+        SendResult(success=False, error="cardid is invalid", raw_response=invalid),
+        SendResult(success=True, message_id="om-static"),
+    ])
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        "plugins.platforms.feishu.feishu_cardkit.asyncio.sleep", sleep
+    )
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+
+    result = await runtime.try_send("oc_chat", "done", reply_to=None, metadata=None)
+
+    assert result.success is True
+    assert send_reference.await_count == 2
+    assert sleep.await_args_list == [call(0.3), call(0.5)]
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_retry_other_reference_failures(monkeypatch):
+    client = _runtime_client()
+    denied = MagicMock(code=230001, msg="permission denied")
+    send_reference = AsyncMock(return_value=SendResult(
+        success=False, error="permission denied", raw_response=denied
+    ))
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        "plugins.platforms.feishu.feishu_cardkit.asyncio.sleep", sleep
+    )
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+
+    result = await runtime.try_send("oc_chat", "done", reply_to=None, metadata=None)
+
+    assert result.success is False
+    assert send_reference.await_count == 1
+    assert sleep.await_args_list == [call(0.3)]
+
+
+@pytest.mark.asyncio
+async def test_runtime_closes_orphan_when_reference_fails():
+    client = _runtime_client()
+    send_reference = AsyncMock(
+        return_value=SendResult(success=False, error="send failed")
+    )
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+
+    result = await runtime.try_send("oc_chat", "done", reply_to=None, metadata=None)
+
+    assert result.success is False
+    client.close_card.assert_awaited_once_with("card-progress", "done", 1)
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_all_attempts_every_session_and_forgets_them():
+    client = _runtime_client()
+    send_reference = AsyncMock(side_effect=[
+        SendResult(success=True, message_id="om-one"),
+        SendResult(success=True, message_id="om-two"),
+    ])
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+    one = await runtime.try_send(
+        "oc_one", "one", reply_to=None, metadata={"expect_edits": True}
+    )
+    two = await runtime.try_send(
+        "oc_two", "two", reply_to=None, metadata={"expect_edits": True}
+    )
+    client.close_card.side_effect = [RuntimeError("first close failed"), None]
+
+    await runtime.close_all()
+
+    assert client.close_card.await_count == 2
+    assert await runtime.edit_if_managed(
+        "oc_one", one.message_id, "late", finalize=False
+    ) is None
+    assert await runtime.edit_if_managed(
+        "oc_two", two.message_id, "late", finalize=False
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_failed_assistant_finalize_stays_managed_for_retry():
+    client = _runtime_client()
+    send_reference = AsyncMock(
+        return_value=SendResult(success=True, message_id="om-assistant")
+    )
+    runtime = FeishuCardKitRuntime(client=client, send_card_reference=send_reference)
+    sent = await runtime.try_send(
+        "oc_chat", "preview", reply_to=None, metadata={"expect_edits": True}
+    )
+    client.close_card.side_effect = RuntimeError("close failed")
+
+    failed = await runtime.edit_if_managed(
+        "oc_chat", sent.message_id, "final", finalize=True
+    )
+    client.close_card.side_effect = None
+    retried = await runtime.edit_if_managed(
+        "oc_chat", sent.message_id, "final", finalize=True
+    )
+
+    assert failed.success is False
+    assert retried.success is True
+    assert await runtime.edit_if_managed(
+        "oc_chat", sent.message_id, "late", finalize=False
+    ) is None
