@@ -132,11 +132,8 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from plugins.platforms.feishu.feishu_cardkit import (
-    CARDKIT_ASSISTANT_PROFILE,
-    CARDKIT_STATIC_PROFILE,
-    CARDKIT_TOOL_PROGRESS_PROFILE,
     FeishuCardKitClient,
-    FeishuStreamingCardSession,
+    FeishuCardKitRuntime,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -198,11 +195,6 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
-# CardKit create and IM's card_id index are eventually consistent: a reference
-# sent right after create can be rejected with code 230099 / ext 11310
-# ("cardid is invalid") because IM hasn't indexed the new card yet. Match
-# narrowly so we only retry this transient mismatch, not other 230099 causes.
-_CARDKIT_CARDID_INVALID_RE = re.compile(r"cardid is invalid|ErrCode:\s*11310", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -231,14 +223,6 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
-# Short backoff for retrying a freshly-created CardKit card reference when IM
-# hasn't yet indexed the new card_id (230099 / 11310). Replaces a blanket
-# pre-send sleep — only paid when the transient mismatch actually occurs.
-# IM's card_id index typically lags CardKit create by a few hundred ms, so a
-# reference sent at 0s almost always misses — front-load a short initial wait
-# to land the first attempt, then escalate if still not indexed.
-_CARDKIT_REFERENCE_INITIAL_DELAY_SECONDS = 0.3
-_CARDKIT_REFERENCE_BACKOFF_SECONDS = (0.5, 1.0)
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -1515,6 +1499,10 @@ class FeishuAdapter(BasePlatformAdapter):
     # is almost certain.
     _SPLIT_THRESHOLD = 4000
 
+    @property
+    def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
+        return self._cardkit_runtime is not None
+
     # =========================================================================
     # Lifecycle — init / settings / connect / disconnect
     # =========================================================================
@@ -1580,39 +1568,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
-        self._cardkit_client = None
-        self._cardkit_sdk_source = None
-        self._cardkit_sessions: Dict[str, Any] = {}
-        self._cardkit_open_by_chat: Dict[str, Dict[str, Any]] = {}
-
-    @staticmethod
-    def _cardkit_streaming_mode(metadata: Optional[Dict[str, Any]]) -> tuple[bool, str]:
-        metadata = metadata or {}
-        if metadata.get("message_kind") == "tool_progress":
-            return True, CARDKIT_TOOL_PROGRESS_PROFILE
-        if metadata.get("expect_edits"):
-            return True, CARDKIT_ASSISTANT_PROFILE
-        return False, CARDKIT_STATIC_PROFILE
-
-    def _should_try_cardkit(self) -> bool:
-        settings = getattr(self, "_settings", None)
-        client = getattr(self, "_client", None)
-        return bool(
-            FEISHU_AVAILABLE
-            and FeishuCardKitClient is not None
-            and FeishuStreamingCardSession is not None
-            and getattr(settings, "app_id", None)
-            and getattr(settings, "app_secret", None)
-            and client is not None
-        )
-
-    def _get_cardkit_client(self) -> Any:
-        if not self._should_try_cardkit():
-            return None
-        if self._cardkit_client is None or self._cardkit_sdk_source is not self._client:
-            self._cardkit_client = FeishuCardKitClient(self._client)
-            self._cardkit_sdk_source = self._client
-        return self._cardkit_client
+        self._cardkit_runtime: Optional[FeishuCardKitRuntime] = None
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1867,6 +1823,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
+            self._cardkit_runtime = FeishuCardKitRuntime(
+                client=FeishuCardKitClient(self._client),
+                send_card_reference=self._send_cardkit_reference_once,
+            )
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True
@@ -1882,8 +1842,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._running = False
         # Finalize streaming cards while the SDK client is still available,
         # before websocket teardown, so they don't get stuck on Feishu's UI.
-        if FEISHU_AVAILABLE and self._cardkit_sessions:
-            await self._close_all_cardkit_sessions()
+        runtime = self._cardkit_runtime
+        if runtime is not None:
+            await runtime.close_all()
+            self._cardkit_runtime = None
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -2013,19 +1975,21 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        if self._should_try_cardkit():
-            result = await self._send_cardkit(
+        runtime = self._cardkit_runtime
+        if runtime is not None:
+            result = await runtime.try_send(
                 chat_id,
                 content,
                 reply_to=reply_to,
                 metadata=metadata,
             )
-            if result.success:
-                return result
-            logger.warning(
-                "[Feishu] CardKit send failed; falling back to standard message: %s",
-                result.error,
-            )
+            if result is not None:
+                if result.success:
+                    return result
+                logger.warning(
+                    "[Feishu] CardKit send failed; falling back to standard message: %s",
+                    result.error,
+                )
 
         return await self._send_standard_message(
             chat_id,
@@ -2098,20 +2062,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
-    @staticmethod
-    def _is_cardkit_cardid_invalid(response: Any) -> bool:
-        """True when IM rejected a card reference because its card_id index
-        hasn't caught up with CardKit yet (code 230099 / ext 11310,
-        "cardid is invalid"). Transient — retried with a short backoff.
-        """
-        if FeishuAdapter._response_succeeded(response):
-            return False
-        if str(getattr(response, "code", "")) != "230099":
-            return False
-        msg = str(getattr(response, "msg", "") or "")
-        return bool(_CARDKIT_CARDID_INVALID_RE.search(msg))
-
-    async def _send_cardkit_reference(
+    async def _send_cardkit_reference_once(
         self,
         card_id: str,
         chat_id: str,
@@ -2122,209 +2073,14 @@ class FeishuAdapter(BasePlatformAdapter):
             {"type": "card", "data": {"card_id": card_id}},
             ensure_ascii=False,
         )
-        # CardKit create and IM's card_id index are eventually consistent: a
-        # reference sent immediately after create may be rejected with 230099 /
-        # 11310 ("cardid is invalid"). Wait briefly up front so the first
-        # attempt usually lands, then retry with escalating backoff if IM is
-        # still propagating the new card_id.
-        await asyncio.sleep(_CARDKIT_REFERENCE_INITIAL_DELAY_SECONDS)
-        backoffs = _CARDKIT_REFERENCE_BACKOFF_SECONDS
-        response: Any = None
-        for attempt in range(len(backoffs) + 1):
-            response = await self._feishu_send_with_retry(
-                chat_id=chat_id,
-                msg_type="interactive",
-                payload=payload,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-            if self._response_succeeded(response) or not self._is_cardkit_cardid_invalid(response):
-                return self._finalize_send_result(response, "cardkit send failed")
-            if attempt < len(backoffs):
-                backoff = backoffs[attempt]
-                logger.warning(
-                    "[Feishu] CardKit card_id %s not yet indexed by IM (code %s); "
-                    "retrying reference send in %ss (attempt %d/%d)",
-                    card_id,
-                    getattr(response, "code", None),
-                    backoff,
-                    attempt + 1,
-                    len(backoffs),
-                )
-                await asyncio.sleep(backoff)
-        return self._finalize_send_result(response, "cardkit send failed")
-
-    async def _close_cardkit_siblings(self, chat_id: str) -> None:
-        open_by_chat = getattr(self, "_cardkit_open_by_chat", {})
-        sessions = getattr(self, "_cardkit_sessions", {})
-        chat_sessions = open_by_chat.get(chat_id)
-        if not chat_sessions:
-            return
-
-        for message_id, session in list(chat_sessions.items()):
-            if getattr(session, "profile", None) != CARDKIT_TOOL_PROGRESS_PROFILE:
-                continue
-            should_remove = bool(getattr(session, "closed", False))
-            try:
-                if should_remove:
-                    result = SendResult(success=True, message_id=message_id)
-                else:
-                    result = await session.close(None)
-                if isinstance(result, SendResult) and not result.success:
-                    logger.debug(
-                        "[Feishu] CardKit sibling close failed for %s: %s",
-                        message_id,
-                        result.error,
-                    )
-                    continue
-                should_remove = True
-            except Exception as exc:
-                logger.debug(
-                    "[Feishu] CardKit sibling close raised for %s: %s",
-                    message_id,
-                    exc,
-                    exc_info=True,
-                )
-                continue
-            if should_remove:
-                chat_sessions.pop(message_id, None)
-                sessions.pop(message_id, None)
-
-        if not chat_sessions:
-            open_by_chat.pop(chat_id, None)
-
-    async def _close_all_cardkit_sessions(self) -> None:
-        """Best-effort close of every open CardKit streaming session."""
-        sessions = getattr(self, "_cardkit_sessions", {})
-        if not sessions:
-            return
-        for message_id, session in list(sessions.items()):
-            try:
-                await session.close(getattr(session, "current_text", None))
-            except Exception as exc:
-                logger.debug(
-                    "[Feishu] CardKit disconnect close failed for %s: %s",
-                    message_id,
-                    exc,
-                    exc_info=True,
-                )
-        self._cardkit_sessions.clear()
-        self._cardkit_open_by_chat.clear()
-
-    async def _send_static_cardkit(
-        self,
-        cardkit_client: Any,
-        chat_id: str,
-        content: str,
-        *,
-        reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-    ) -> SendResult:
-        await self._close_cardkit_siblings(chat_id)
-        card_id = await cardkit_client.create_card(
-            content=content,
-            streaming_mode=False,
-            profile=CARDKIT_STATIC_PROFILE,
-        )
-        try:
-            reference_result = await self._send_cardkit_reference(
-                card_id=card_id,
-                chat_id=chat_id,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-        except Exception:
-            await self._best_effort_close_card(cardkit_client, card_id, content)
-            raise
-        if not reference_result.success:
-            await self._best_effort_close_card(cardkit_client, card_id, content)
-            return reference_result
-        return reference_result
-
-    async def _best_effort_close_card(
-        self,
-        cardkit_client: Any,
-        card_id: str,
-        content: str,
-    ) -> None:
-        """Best-effort close of a created CardKit card whose reference send failed."""
-        try:
-            await cardkit_client.close_card(card_id, content, 1)
-        except Exception:
-            logger.debug(
-                "[Feishu] CardKit best-effort close failed for %s",
-                card_id,
-                exc_info=True,
-            )
-
-    async def _send_streaming_cardkit(
-        self,
-        cardkit_client: Any,
-        chat_id: str,
-        content: str,
-        *,
-        reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-        profile: str,
-    ) -> SendResult:
-        await self._close_cardkit_siblings(chat_id)
-        session = FeishuStreamingCardSession(
-            client=cardkit_client,
+        response = await self._feishu_send_with_retry(
             chat_id=chat_id,
-            send_card_reference=self._send_cardkit_reference,
-            profile=profile,
+            msg_type="interactive",
+            payload=payload,
+            reply_to=reply_to,
+            metadata=metadata,
         )
-        try:
-            result = await session.start(
-                content,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[Feishu] CardKit streaming start failed: %s",
-                exc,
-                exc_info=True,
-            )
-            return SendResult(success=False, error=str(exc))
-
-        if result.success and result.message_id:
-            self._cardkit_sessions[result.message_id] = session
-            self._cardkit_open_by_chat.setdefault(chat_id, {})[result.message_id] = session
-        return result
-
-    async def _send_cardkit(
-        self,
-        chat_id: str,
-        content: str,
-        *,
-        reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-    ) -> SendResult:
-        try:
-            cardkit_client = self._get_cardkit_client()
-            if cardkit_client is None:
-                return SendResult(success=False, error="CardKit unavailable")
-            streaming_mode, profile = self._cardkit_streaming_mode(metadata)
-            if streaming_mode:
-                return await self._send_streaming_cardkit(
-                    cardkit_client,
-                    chat_id,
-                    content,
-                    reply_to=reply_to,
-                    metadata=metadata,
-                    profile=profile,
-                )
-            return await self._send_static_cardkit(
-                cardkit_client,
-                chat_id,
-                content,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-        except Exception as exc:
-            logger.warning("[Feishu] CardKit setup failed: %s", exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
+        return self._finalize_send_result(response, "cardkit send failed")
 
     async def edit_message(
         self,
@@ -2338,33 +2094,16 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        sessions = getattr(self, "_cardkit_sessions", {})
-        session = sessions.get(message_id)
-        if session is not None:
-            try:
-                if finalize and getattr(session, "profile", None) != CARDKIT_TOOL_PROGRESS_PROFILE:
-                    result = await session.close(content)
-                    if result.success:
-                        sessions.pop(message_id, None)
-                        chat_sessions = getattr(self, "_cardkit_open_by_chat", {}).get(chat_id)
-                        if chat_sessions is not None:
-                            chat_sessions.pop(message_id, None)
-                            if not chat_sessions:
-                                self._cardkit_open_by_chat.pop(chat_id, None)
-                    return result
-
-                result = await session.update(content)
-                if result.success:
-                    self._cardkit_open_by_chat.setdefault(chat_id, {})[message_id] = session
+        runtime = self._cardkit_runtime
+        if runtime is not None:
+            result = await runtime.edit_if_managed(
+                chat_id,
+                message_id,
+                content,
+                finalize=finalize,
+            )
+            if result is not None:
                 return result
-            except Exception as exc:
-                logger.error(
-                    "[Feishu] Failed to edit CardKit message %s: %s",
-                    message_id,
-                    exc,
-                    exc_info=True,
-                )
-                return SendResult(success=False, error=str(exc))
 
         content = self.format_message(content)
         try:
