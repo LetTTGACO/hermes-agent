@@ -1,5 +1,8 @@
 """Feishu adapter coverage for its CardKit runtime boundary."""
 
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +11,22 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from plugins.platforms.feishu.adapter import FeishuAdapter
+
+
+def test_adapter_import_does_not_eagerly_load_lark_oapi():
+    script = (
+        "import sys; "
+        "import plugins.platforms.feishu.adapter; "
+        "raise SystemExit(1 if 'lark_oapi' in sys.modules else 0)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[4],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def _make_adapter():
