@@ -1,0 +1,179 @@
+"""Personal Feishu CardKit progress integration coverage."""
+
+import importlib
+import sys
+import time
+import types
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    SendResult,
+    _reply_anchor_for_event,
+)
+from gateway.session import SessionSource
+
+
+class _ProgressAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.FEISHU)
+        self.sent: list[dict] = []
+        self.edits: list[dict] = []
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append({
+            "chat_id": chat_id,
+            "content": content,
+            "reply_to": reply_to,
+            "metadata": metadata,
+        })
+        return SendResult(success=True, message_id="progress-1")
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize=False, metadata=None
+    ) -> SendResult:
+        self.edits.append({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "content": content,
+            "finalize": finalize,
+            "metadata": metadata,
+        })
+        return SendResult(success=True, message_id=message_id)
+
+    async def send_typing(self, chat_id, metadata=None) -> None:
+        return None
+
+    async def stop_typing(self, chat_id) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id: str):
+        return {"id": chat_id}
+
+
+class _Agent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        callback = self.tool_progress_callback
+        assert callback is not None
+        callback("tool.started", "terminal", "pwd", {})
+        time.sleep(0.35)
+        callback("tool.started", "browser_navigate", "https://example.com", {})
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+def _make_runner(adapter):
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {adapter.platform: adapter}
+    runner._voice_mode = {}
+    runner._prefill_messages = []
+    runner._ephemeral_system_prompt = ""
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._session_db = None
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.config = SimpleNamespace(
+        thread_sessions_per_user=False,
+        group_sessions_per_user=False,
+        stt_enabled=False,
+    )
+    return runner
+
+
+def test_feishu_dm_drops_reply_anchor():
+    source = SimpleNamespace(
+        platform=Platform.FEISHU,
+        chat_type="dm",
+        thread_id=None,
+    )
+    event = SimpleNamespace(
+        source=source,
+        raw_message=None,
+        message_id="om_triggering_user_message",
+        reply_to_message_id=None,
+    )
+
+    assert _reply_anchor_for_event(event) is None
+
+
+def test_feishu_group_keeps_reply_anchor():
+    source = SimpleNamespace(
+        platform=Platform.FEISHU,
+        chat_type="group",
+        thread_id=None,
+    )
+    event = SimpleNamespace(
+        source=source,
+        raw_message=None,
+        message_id="om_triggering_user_message",
+        reply_to_message_id=None,
+    )
+
+    assert _reply_anchor_for_event(event) == "om_triggering_user_message"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_feishu_progress_replies_inside_existing_thread(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _Agent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = _ProgressAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        thread_id="topic_17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-feishu-progress",
+        session_key="agent:main:feishu:group:oc_chat:topic_17585",
+        event_message_id="om_triggering_user_message",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent[0]["reply_to"] == "om_triggering_user_message"
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "topic_17585",
+        "message_kind": "tool_progress",
+    }
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[0]["metadata"] == {
+        "thread_id": "topic_17585",
+        "message_kind": "tool_progress",
+    }
