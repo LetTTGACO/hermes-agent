@@ -2,7 +2,7 @@
 
 import importlib
 import sys
-import time
+import threading
 import types
 from types import SimpleNamespace
 
@@ -22,6 +22,8 @@ class _ProgressAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.FEISHU)
         self.sent: list[dict] = []
         self.edits: list[dict] = []
+        self.progress_sent = threading.Event()
+        self.progress_edited = threading.Event()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -36,6 +38,7 @@ class _ProgressAdapter(BasePlatformAdapter):
             "reply_to": reply_to,
             "metadata": metadata,
         })
+        self.progress_sent.set()
         return SendResult(success=True, message_id="progress-1")
 
     async def edit_message(
@@ -48,6 +51,7 @@ class _ProgressAdapter(BasePlatformAdapter):
             "finalize": finalize,
             "metadata": metadata,
         })
+        self.progress_edited.set()
         return SendResult(success=True, message_id=message_id)
 
     async def send_typing(self, chat_id, metadata=None) -> None:
@@ -60,19 +64,25 @@ class _ProgressAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
-class _Agent:
-    def __init__(self, **kwargs):
-        self.tool_progress_callback = kwargs.get("tool_progress_callback")
-        self.tools = []
+def _agent_type(progress_sent):
+    class _Agent:
+        def __init__(self, **kwargs):
+            self.tool_progress_callback = kwargs.get("tool_progress_callback")
+            self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        callback = self.tool_progress_callback
-        assert callback is not None
-        callback("tool.started", "terminal", "pwd", {})
-        time.sleep(0.35)
-        callback("tool.started", "browser_navigate", "https://example.com", {})
-        time.sleep(0.35)
-        return {"final_response": "done", "messages": [], "api_calls": 1}
+        def run_conversation(
+            self, message, conversation_history=None, task_id=None
+        ):
+            callback = self.tool_progress_callback
+            assert callback is not None
+            callback("tool.started", "terminal", "pwd", {})
+            assert progress_sent.wait(timeout=5), "first progress send did not arrive"
+            callback(
+                "tool.started", "browser_navigate", "https://example.com", {}
+            )
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    return _Agent
 
 
 def _make_runner(adapter):
@@ -138,11 +148,11 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    adapter = _ProgressAdapter()
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _Agent
+    fake_run_agent.AIAgent = _agent_type(adapter.progress_sent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = _ProgressAdapter()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -167,6 +177,8 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(
     )
 
     assert result["final_response"] == "done"
+    assert adapter.progress_sent.is_set()
+    assert adapter.progress_edited.is_set()
     assert adapter.sent[0]["reply_to"] == "om_triggering_user_message"
     assert adapter.sent[0]["metadata"] == {
         "thread_id": "topic_17585",

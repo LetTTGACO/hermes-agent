@@ -1,5 +1,6 @@
 """Feishu adapter coverage for its CardKit runtime boundary."""
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from plugins.platforms.feishu.adapter import FeishuAdapter
+from plugins.platforms.feishu.feishu_cardkit import FeishuCardKitRuntime
 
 
 def test_adapter_import_does_not_eagerly_load_lark_oapi():
@@ -89,6 +91,98 @@ async def test_send_without_runtime_uses_standard_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_cardkit_reference_once_uses_interactive_payload_and_finalizes(
+    monkeypatch,
+):
+    adapter = _make_adapter()
+    response = SimpleNamespace(data=SimpleNamespace(message_id="om-card"))
+    send_with_retry = AsyncMock(return_value=response)
+    finalized = SendResult(
+        success=True, message_id="om-card", raw_response=response
+    )
+    finalize = MagicMock(return_value=finalized)
+    monkeypatch.setattr(adapter, "_feishu_send_with_retry", send_with_retry)
+    monkeypatch.setattr(adapter, "_finalize_send_result", finalize)
+    metadata = {
+        "expect_edits": True,
+        "thread_id": "topic-1",
+        "reply_to_message_id": "om-trigger",
+    }
+
+    result = await adapter._send_cardkit_reference_once(
+        card_id="card-1",
+        chat_id="oc-chat",
+        reply_to="om-trigger",
+        metadata=metadata,
+    )
+
+    assert result is finalized
+    send_with_retry.assert_awaited_once_with(
+        chat_id="oc-chat",
+        msg_type="interactive",
+        payload=json.dumps(
+            {"type": "card", "data": {"card_id": "card-1"}},
+            ensure_ascii=False,
+        ),
+        reply_to="om-trigger",
+        metadata=metadata,
+    )
+    finalize.assert_called_once_with(response, "cardkit send failed")
+
+
+@pytest.mark.asyncio
+async def test_adapter_runtime_callback_preserves_interactive_thread_routing(
+    monkeypatch,
+):
+    adapter = _make_adapter()
+    adapter._client = object()
+    cardkit_client = SimpleNamespace(
+        create_card=AsyncMock(return_value="card-1"),
+        update_element_content=AsyncMock(return_value=None),
+        close_card=AsyncMock(return_value=None),
+    )
+    adapter._cardkit_runtime = FeishuCardKitRuntime(
+        client=cardkit_client,
+        send_card_reference=adapter._send_cardkit_reference_once,
+    )
+    response = SimpleNamespace(
+        success=lambda: True,
+        code=0,
+        msg="",
+        data=SimpleNamespace(message_id="om-card"),
+    )
+    transport = AsyncMock(return_value=response)
+    monkeypatch.setattr(adapter, "_send_raw_message", transport)
+    monkeypatch.setattr(
+        "plugins.platforms.feishu.feishu_cardkit.asyncio.sleep", AsyncMock()
+    )
+    metadata = {
+        "expect_edits": True,
+        "thread_id": "topic-1",
+        "reply_to_message_id": "om-trigger",
+    }
+
+    result = await adapter.send(
+        "oc-chat", "hello", reply_to="om-trigger", metadata=metadata
+    )
+
+    assert result.success is True
+    assert result.message_id == "om-card"
+    transport.assert_awaited_once_with(
+        chat_id="oc-chat",
+        msg_type="interactive",
+        payload=json.dumps(
+            {"type": "card", "data": {"card_id": "card-1"}},
+            ensure_ascii=False,
+        ),
+        reply_to="om-trigger",
+        metadata=metadata,
+    )
+    cardkit_client.create_card.assert_awaited_once()
+    assert cardkit_client.update_element_content.await_args.args[2] == "hello"
+
+
+@pytest.mark.asyncio
 async def test_edit_uses_runtime_only_when_message_is_managed(monkeypatch):
     adapter = _make_adapter()
     adapter._client = object()
@@ -161,9 +255,12 @@ async def test_disconnect_closes_runtime_before_sdk_teardown(monkeypatch):
     )
     monkeypatch.setattr(adapter, "_cancel_pending_tasks", AsyncMock())
     monkeypatch.setattr(adapter, "_release_app_lock", AsyncMock())
-    monkeypatch.setattr(adapter, "_shutdown_sdk_executor", lambda: None)
+    monkeypatch.setattr(
+        adapter, "_shutdown_sdk_executor", lambda: order.append("sdk")
+    )
 
     await adapter.disconnect()
 
     assert order.index("cards") < order.index("transport")
+    assert order.index("cards") < order.index("sdk")
     assert adapter._cardkit_runtime is None

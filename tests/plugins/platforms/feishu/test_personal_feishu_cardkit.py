@@ -1,5 +1,6 @@
 """Personal fork tests for Feishu CardKit helper module."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -657,3 +658,205 @@ async def test_runtime_failed_assistant_finalize_stays_managed_for_retry():
     assert await runtime.edit_if_managed(
         "oc_chat", sent.message_id, "late", finalize=False
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_serializes_progress_update_before_sibling_close(monkeypatch):
+    update_started = asyncio.Event()
+    release_update = asyncio.Event()
+    sibling_close_attempted = asyncio.Event()
+    sibling_close_called = asyncio.Event()
+    operations = []
+
+    class ControlledClient:
+        def __init__(self):
+            self.card_ids = iter(("card-progress", "card-static"))
+
+        async def create_card(self, **kwargs):
+            return next(self.card_ids)
+
+        async def update_element_content(
+            self, card_id, element_id, content, sequence
+        ):
+            operations.append(("update-start", card_id, sequence, content))
+            if content == "running tool 2":
+                update_started.set()
+                await release_update.wait()
+            operations.append(("update-end", card_id, sequence, content))
+
+        async def close_card(self, card_id, final_text, sequence):
+            operations.append(("close", card_id, sequence, final_text))
+            if card_id == "card-progress":
+                sibling_close_called.set()
+
+    async def send_reference(**kwargs):
+        message_id = (
+            "om-progress"
+            if kwargs["card_id"] == "card-progress"
+            else "om-static"
+        )
+        return SendResult(success=True, message_id=message_id)
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        "plugins.platforms.feishu.feishu_cardkit.asyncio.sleep", sleep
+    )
+    original_close = FeishuStreamingCardSession.close
+
+    async def announced_close(session, final_text=None):
+        if session.card_id == "card-progress":
+            sibling_close_attempted.set()
+        return await original_close(session, final_text)
+
+    monkeypatch.setattr(FeishuStreamingCardSession, "close", announced_close)
+
+    runtime = FeishuCardKitRuntime(
+        client=ControlledClient(), send_card_reference=send_reference
+    )
+    progress = await runtime.try_send(
+        "oc_chat",
+        "running",
+        reply_to=None,
+        metadata={"message_kind": "tool_progress"},
+    )
+    operations.clear()
+
+    update_task = asyncio.create_task(
+        runtime.edit_if_managed(
+            "oc_chat", progress.message_id, "running tool 2", finalize=True
+        )
+    )
+    await asyncio.wait_for(update_started.wait(), timeout=5)
+    final_task = asyncio.create_task(
+        runtime.try_send("oc_chat", "done", reply_to=None, metadata=None)
+    )
+    await asyncio.wait_for(sibling_close_attempted.wait(), timeout=5)
+    close_overlapped_update = sibling_close_called.is_set()
+
+    release_update.set()
+    edited, final = await asyncio.gather(update_task, final_task)
+
+    assert edited.success is True
+    assert final.success is True
+    assert close_overlapped_update is False
+    progress_operations = [
+        (kind, sequence)
+        for kind, card_id, sequence, _ in operations
+        if card_id == "card-progress"
+    ]
+    assert progress_operations == [
+        ("update-start", 3),
+        ("update-end", 3),
+        ("close", 4),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_all_closes_session_from_inflight_send(monkeypatch):
+    inflight_reference_started = asyncio.Event()
+    release_inflight_reference = asyncio.Event()
+    close_all_started = asyncio.Event()
+    release_existing_close = asyncio.Event()
+    closed_cards = []
+
+    class ControlledClient:
+        def __init__(self):
+            self.card_ids = iter(("card-existing", "card-inflight"))
+
+        async def create_card(self, **kwargs):
+            return next(self.card_ids)
+
+        async def update_element_content(self, *args):
+            return None
+
+        async def close_card(self, card_id, final_text, sequence):
+            closed_cards.append(card_id)
+            if card_id == "card-existing":
+                close_all_started.set()
+                await release_existing_close.wait()
+
+    reference_count = 0
+
+    async def send_reference(**kwargs):
+        nonlocal reference_count
+        reference_count += 1
+        if reference_count == 2:
+            inflight_reference_started.set()
+            await release_inflight_reference.wait()
+        return SendResult(
+            success=True,
+            message_id=("om-existing" if reference_count == 1 else "om-inflight"),
+        )
+
+    monkeypatch.setattr(
+        "plugins.platforms.feishu.feishu_cardkit.asyncio.sleep", AsyncMock()
+    )
+    runtime = FeishuCardKitRuntime(
+        client=ControlledClient(), send_card_reference=send_reference
+    )
+    await runtime.try_send(
+        "oc_existing", "", reply_to=None, metadata={"expect_edits": True}
+    )
+    inflight_task = asyncio.create_task(
+        runtime.try_send(
+            "oc_inflight", "", reply_to=None, metadata={"expect_edits": True}
+        )
+    )
+    await asyncio.wait_for(inflight_reference_started.wait(), timeout=5)
+
+    close_task = asyncio.create_task(runtime.close_all())
+    await asyncio.wait_for(close_all_started.wait(), timeout=5)
+    release_inflight_reference.set()
+    inflight = await asyncio.wait_for(inflight_task, timeout=5)
+    release_existing_close.set()
+    await asyncio.wait_for(close_task, timeout=5)
+
+    assert inflight.success is True
+    assert closed_cards == ["card-existing", "card-inflight"]
+    assert await runtime.edit_if_managed(
+        "oc_inflight", inflight.message_id, "late", finalize=False
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_all_gates_new_sends(monkeypatch):
+    close_all_started = asyncio.Event()
+    release_close = asyncio.Event()
+    created_cards = []
+
+    class ControlledClient:
+        async def create_card(self, **kwargs):
+            card_id = f"card-{len(created_cards) + 1}"
+            created_cards.append(card_id)
+            return card_id
+
+        async def update_element_content(self, *args):
+            return None
+
+        async def close_card(self, card_id, final_text, sequence):
+            close_all_started.set()
+            await release_close.wait()
+
+    async def send_reference(**kwargs):
+        return SendResult(success=True, message_id=f"om-{kwargs['card_id']}")
+
+    monkeypatch.setattr(
+        "plugins.platforms.feishu.feishu_cardkit.asyncio.sleep", AsyncMock()
+    )
+    runtime = FeishuCardKitRuntime(
+        client=ControlledClient(), send_card_reference=send_reference
+    )
+    await runtime.try_send(
+        "oc_existing", "", reply_to=None, metadata={"expect_edits": True}
+    )
+    close_task = asyncio.create_task(runtime.close_all())
+    await asyncio.wait_for(close_all_started.wait(), timeout=5)
+
+    late = await runtime.try_send(
+        "oc_late", "", reply_to=None, metadata={"expect_edits": True}
+    )
+    release_close.set()
+    await asyncio.wait_for(close_task, timeout=5)
+
+    assert late is None
+    assert created_cards == ["card-1"]

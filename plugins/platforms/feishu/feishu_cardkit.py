@@ -305,6 +305,7 @@ class FeishuStreamingCardSession:
         self.sequence = 1
         self.current_text = ""
         self.closed = False
+        self._operation_lock = asyncio.Lock()
 
     async def start(
         self,
@@ -372,34 +373,61 @@ class FeishuStreamingCardSession:
 
     async def update(self, text: str) -> SendResult:
         """Push a full-text snapshot to the card."""
-        if self.closed or not self.card_id or not self.message_id:
-            return SendResult(success=False, error="CardKit session is not active")
+        async with self._operation_lock:
+            if self.closed or not self.card_id or not self.message_id:
+                return SendResult(
+                    success=False, error="CardKit session is not active"
+                )
 
-        next_text = strip_streaming_cursor(text)
+            next_text = strip_streaming_cursor(text)
 
-        if not next_text or next_text == self.current_text:
+            if not next_text or next_text == self.current_text:
+                return SendResult(success=True, message_id=self.message_id)
+
+            await self._push_update(next_text, force=True)
             return SendResult(success=True, message_id=self.message_id)
-
-        await self._push_update(next_text, force=True)
-        return SendResult(success=True, message_id=self.message_id)
 
     async def close(self, final_text: Optional[str] = None) -> SendResult:
         """Push final text and disable streaming mode."""
-        if self.closed:
-            return SendResult(success=True, message_id=self.message_id)
+        async with self._operation_lock:
+            if self.closed:
+                return SendResult(success=True, message_id=self.message_id)
 
-        if not self.card_id or not self.message_id:
-            return SendResult(success=False, error="CardKit session is not active")
+            if not self.card_id or not self.message_id:
+                return SendResult(
+                    success=False, error="CardKit session is not active"
+                )
 
-        final_snapshot = strip_streaming_cursor(final_text) if final_text else ""
-        merged = final_snapshot or self.current_text
+            final_snapshot = (
+                strip_streaming_cursor(final_text) if final_text else ""
+            )
+            merged = final_snapshot or self.current_text
 
-        if merged and merged != self.current_text:
+            if merged and merged != self.current_text:
+                try:
+                    await self._push_update(merged, force=True)
+                except Exception as exc:
+                    logger.warning(
+                        "[Feishu] CardKit final update failed for %s: %s",
+                        self.card_id,
+                        exc,
+                    )
+                    return SendResult(
+                        success=False,
+                        message_id=self.message_id,
+                        error=str(exc),
+                    )
+
+            self.sequence += 1
             try:
-                await self._push_update(merged, force=True)
+                await self.client.close_card(
+                    self.card_id,
+                    merged or self.current_text,
+                    self.sequence,
+                )
             except Exception as exc:
                 logger.warning(
-                    "[Feishu] CardKit final update failed for %s: %s",
+                    "[Feishu] CardKit close failed for %s: %s",
                     self.card_id,
                     exc,
                 )
@@ -409,27 +437,8 @@ class FeishuStreamingCardSession:
                     error=str(exc),
                 )
 
-        self.sequence += 1
-        try:
-            await self.client.close_card(
-                self.card_id,
-                merged or self.current_text,
-                self.sequence,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[Feishu] CardKit close failed for %s: %s",
-                self.card_id,
-                exc,
-            )
-            return SendResult(
-                success=False,
-                message_id=self.message_id,
-                error=str(exc),
-            )
-
-        self.closed = True
-        return SendResult(success=True, message_id=self.message_id)
+            self.closed = True
+            return SendResult(success=True, message_id=self.message_id)
 
     async def _best_effort_close_created_card(self) -> None:
         """Best-effort close of a created card whose reference send failed.
@@ -486,10 +495,21 @@ class FeishuCardKitRuntime:
         self._client = client
         self._send_card_reference = send_card_reference
         self._sessions: dict[str, FeishuStreamingCardSession] = {}
+        self._registry_lock = asyncio.Lock()
+        self._close_all_lock = asyncio.Lock()
+        self._closing = False
+        self._in_flight_sends = 0
+        self._sends_drained = asyncio.Event()
+        self._sends_drained.set()
 
     async def try_send(self, chat_id, content, *, reply_to, metadata):
         if self._client is None:
             return None
+        async with self._registry_lock:
+            if self._closing:
+                return None
+            self._in_flight_sends += 1
+            self._sends_drained.clear()
         try:
             await self._close_tool_progress_siblings(chat_id)
             streaming, profile = self._streaming_mode(metadata)
@@ -504,26 +524,41 @@ class FeishuCardKitRuntime:
                     content, reply_to=reply_to, metadata=metadata
                 )
                 if result.success and result.message_id:
-                    self._sessions[result.message_id] = session
+                    async with self._registry_lock:
+                        close_after_start = self._closing
+                        if not close_after_start:
+                            self._sessions[result.message_id] = session
+                    if close_after_start:
+                        await self._best_effort_close_session(
+                            result.message_id, session
+                        )
                 return result
             return await self._send_static(
                 chat_id, content, reply_to=reply_to, metadata=metadata
             )
         except Exception as exc:
-            logger.warning("[Feishu] CardKit send failed: %s", exc, exc_info=True)
+            logger.warning(
+                "[Feishu] CardKit send failed: %s", exc, exc_info=True
+            )
             return SendResult(success=False, error=str(exc))
+        finally:
+            async with self._registry_lock:
+                self._in_flight_sends -= 1
+                if self._in_flight_sends == 0:
+                    self._sends_drained.set()
 
     async def edit_if_managed(
         self, chat_id, message_id, content, *, finalize=False
     ):
-        session = self._sessions.get(message_id)
+        async with self._registry_lock:
+            session = self._sessions.get(message_id)
         if session is None:
             return None
         try:
             if finalize and session.profile != CARDKIT_TOOL_PROGRESS_PROFILE:
                 result = await session.close(content)
                 if result.success:
-                    self._sessions.pop(message_id, None)
+                    await self._forget_session(message_id, session)
                 return result
             return await session.update(content)
         except Exception as exc:
@@ -536,18 +571,15 @@ class FeishuCardKitRuntime:
             return SendResult(success=False, message_id=message_id, error=str(exc))
 
     async def close_all(self) -> None:
-        sessions = list(self._sessions.items())
-        for message_id, session in sessions:
-            try:
-                await session.close(session.current_text)
-            except Exception as exc:
-                logger.debug(
-                    "[Feishu] CardKit disconnect close failed for %s: %s",
-                    message_id,
-                    exc,
-                    exc_info=True,
-                )
-        self._sessions.clear()
+        async with self._close_all_lock:
+            async with self._registry_lock:
+                self._closing = True
+                sessions = list(self._sessions.items())
+            for message_id, session in sessions:
+                await self._best_effort_close_session(message_id, session)
+            await self._sends_drained.wait()
+            async with self._registry_lock:
+                self._sessions.clear()
 
     @staticmethod
     def _streaming_mode(metadata):
@@ -615,14 +647,39 @@ class FeishuCardKitRuntime:
                 exc_info=True,
             )
 
+    async def _best_effort_close_session(
+        self, message_id: str, session: FeishuStreamingCardSession
+    ) -> None:
+        try:
+            result = await session.close(None)
+            if not result.success:
+                logger.debug(
+                    "[Feishu] CardKit disconnect close failed for %s: %s",
+                    message_id,
+                    result.error,
+                )
+        except Exception as exc:
+            logger.debug(
+                "[Feishu] CardKit disconnect close failed for %s: %s",
+                message_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _forget_session(
+        self, message_id: str, session: FeishuStreamingCardSession
+    ) -> None:
+        async with self._registry_lock:
+            if self._sessions.get(message_id) is session:
+                self._sessions.pop(message_id, None)
+
     async def _close_tool_progress_siblings(self, chat_id) -> None:
-        for message_id, session in list(self._sessions.items()):
+        async with self._registry_lock:
+            sessions = list(self._sessions.items())
+        for message_id, session in sessions:
             if session.chat_id != chat_id:
                 continue
             if session.profile != CARDKIT_TOOL_PROGRESS_PROFILE:
-                continue
-            if session.closed:
-                self._sessions.pop(message_id, None)
                 continue
             try:
                 result = await session.close(None)
@@ -635,4 +692,4 @@ class FeishuCardKitRuntime:
                 )
                 continue
             if result.success:
-                self._sessions.pop(message_id, None)
+                await self._forget_session(message_id, session)
