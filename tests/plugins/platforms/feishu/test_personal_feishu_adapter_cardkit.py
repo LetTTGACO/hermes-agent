@@ -1,5 +1,6 @@
 """Feishu adapter coverage for its CardKit runtime boundary."""
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -48,7 +49,7 @@ async def test_send_returns_runtime_success_without_standard_send(monkeypatch):
     runtime = SimpleNamespace(try_send=AsyncMock(return_value=runtime_result))
     adapter._cardkit_runtime = runtime
     standard = AsyncMock()
-    monkeypatch.setattr(adapter, "_send_standard_message", standard)
+    monkeypatch.setattr(adapter, "_send_standard_message", standard, raising=False)
 
     result = await adapter.send("oc_chat", "hello", metadata={"expect_edits": True})
 
@@ -66,7 +67,7 @@ async def test_send_runtime_failure_falls_back_exactly_once(monkeypatch):
     adapter._cardkit_runtime = runtime
     fallback = SendResult(success=True, message_id="om-standard")
     standard = AsyncMock(return_value=fallback)
-    monkeypatch.setattr(adapter, "_send_standard_message", standard)
+    monkeypatch.setattr(adapter, "_send_standard_message", standard, raising=False)
 
     result = await adapter.send("oc_chat", "hello", metadata=None)
 
@@ -82,7 +83,7 @@ async def test_send_without_runtime_uses_standard_once(monkeypatch):
     adapter._cardkit_runtime = None
     fallback = SendResult(success=True, message_id="om-standard")
     standard = AsyncMock(return_value=fallback)
-    monkeypatch.setattr(adapter, "_send_standard_message", standard)
+    monkeypatch.setattr(adapter, "_send_standard_message", standard, raising=False)
 
     result = await adapter.send("oc_chat", "hello", metadata=None)
 
@@ -264,3 +265,59 @@ async def test_disconnect_closes_runtime_before_sdk_teardown(monkeypatch):
     assert order.index("cards") < order.index("transport")
     assert order.index("cards") < order.index("sdk")
     assert adapter._cardkit_runtime is None
+
+
+@pytest.mark.asyncio
+async def test_connect_creates_cardkit_runtime_after_transport(monkeypatch):
+    import plugins.platforms.feishu.adapter as module
+    adapter = _make_adapter()
+    order = []
+    sdk_client = object()
+    async def connect_transport():
+        adapter._client = sdk_client
+        order.append("transport")
+    monkeypatch.setattr(module, "_load_lark_oapi", lambda: True)
+    monkeypatch.setattr(module, "acquire_scoped_lock", lambda *args, **kwargs: (True, None))
+    monkeypatch.setattr(adapter, "_connect_with_retry", connect_transport)
+    monkeypatch.setattr(adapter, "_wire_plugin_handlers", lambda *_: None)
+    # Avoid starting a real websocket thread while retaining the connect lifecycle.
+    adapter._connection_mode = "webhook"
+    adapter._verification_token = "test-token"
+    class Client:
+        def __init__(self, client):
+            assert client is sdk_client
+            order.append("cardkit")
+    monkeypatch.setattr(module, "FeishuCardKitClient", Client, raising=False)
+    assert await adapter.connect() is True
+    assert order == ["transport", "cardkit"]
+    assert isinstance(adapter._cardkit_runtime, FeishuCardKitRuntime)
+    assert adapter.REQUIRES_EDIT_FINALIZE is True
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cardkit_error_still_completes_upstream_teardown(monkeypatch):
+    adapter = _make_adapter()
+    order = []
+    supervisor = MagicMock()
+    supervisor.cancel.side_effect = lambda: order.append("supervisor")
+    adapter._ws_supervisor = supervisor
+    async def close_cards():
+        order.append("cards")
+        raise RuntimeError("card close failed")
+    adapter._cardkit_runtime = SimpleNamespace(close_all=close_cards)
+    monkeypatch.setattr(adapter, "_stop_webhook_server", AsyncMock(side_effect=lambda: order.append("transport")))
+    monkeypatch.setattr(adapter, "_cancel_pending_tasks", AsyncMock())
+    monkeypatch.setattr(adapter, "_release_app_lock", AsyncMock(side_effect=lambda: order.append("lock")))
+    monkeypatch.setattr(adapter, "_shutdown_sdk_executor", lambda: order.append("sdk"))
+    await adapter.disconnect()
+    assert order == ["supervisor", "cards", "transport", "sdk", "lock"]
+    assert adapter._cardkit_runtime is None
+    assert adapter._ws_supervisor is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cardkit_cancellation_propagates(monkeypatch):
+    adapter = _make_adapter()
+    adapter._cardkit_runtime = SimpleNamespace(close_all=AsyncMock(side_effect=asyncio.CancelledError))
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.disconnect()

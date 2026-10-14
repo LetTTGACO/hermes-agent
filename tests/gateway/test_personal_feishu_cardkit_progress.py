@@ -15,6 +15,8 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
 )
 from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
+from gateway.run_turn_runner import TurnRunner
 
 
 class _ProgressAdapter(BasePlatformAdapter):
@@ -71,8 +73,9 @@ def _agent_type(progress_sent):
             self.tools = []
 
         def run_conversation(
-            self, message, conversation_history=None, task_id=None
+            self, message, conversation_history=None, task_id=None, **kwargs
         ):
+            assert kwargs["persist_user_platform_id"] == "om-inbound"
             callback = self.tool_progress_callback
             assert callback is not None
             callback("tool.started", "terminal", "pwd", {})
@@ -93,10 +96,14 @@ def _make_runner(adapter):
     runner._prefill_messages = []
     runner._ephemeral_system_prompt = ""
     runner._reasoning_config = None
+    runner._service_tier = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._session_db = None
     runner._running_agents = {}
+    runner._draining = False
     runner._session_run_generation = {}
     runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
     runner.hooks = SimpleNamespace(loaded_hooks=False)
@@ -174,6 +181,7 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(
         session_id="sess-feishu-progress",
         session_key="agent:main:feishu:group:oc_chat:topic_17585",
         event_message_id="om_triggering_user_message",
+        inbound_message_id="om-inbound",
     )
 
     assert result["final_response"] == "done"
@@ -183,9 +191,94 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(
     assert adapter.sent[0]["metadata"] == {
         "thread_id": "topic_17585",
         "message_kind": "tool_progress",
+        "_cardkit_turn_id": "om-inbound",
     }
     assert adapter.edits[0]["message_id"] == "progress-1"
     assert adapter.edits[0]["metadata"] == {
         "thread_id": "topic_17585",
         "message_kind": "tool_progress",
+        "_cardkit_turn_id": "om-inbound",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type,thread_id,anchor", [
+    ("group", "topic-A", "om-trigger"),
+    ("group", None, "om-trigger"),
+    ("dm", None, None),
+])
+async def test_feishu_wiring_preserves_routing_and_true_inbound_owner(
+    chat_type, thread_id, anchor
+):
+    runner = _make_runner(_ProgressAdapter())
+    source = SessionSource(
+        platform=Platform.FEISHU, chat_id="oc-chat", chat_type=chat_type,
+        thread_id=thread_id,
+    )
+    ctx = TurnContext(source=source, inbound_message_id="om-inbound")
+    status = runner._run_agent_bind_turn_wiring(
+        ctx, TurnRunner(runner, ctx), source, anchor, False
+    )
+    progress = ctx._progress_metadata
+    assert progress["message_kind"] == "tool_progress"
+    assert progress["_cardkit_turn_id"] == status["_cardkit_turn_id"] == "om-inbound"
+    assert "message_kind" not in status
+    if thread_id:
+        assert progress["thread_id"] == "topic-A"
+        assert ctx._progress_reply_to == "om-trigger"
+        assert status["reply_to_message_id"] == "om-trigger"
+    else:
+        assert ctx._progress_reply_to is None
+        assert "thread_id" not in progress
+
+
+@pytest.mark.asyncio
+async def test_feishu_wiring_without_inbound_id_does_not_invent_owner():
+    runner = _make_runner(_ProgressAdapter())
+    source = SessionSource(platform=Platform.FEISHU, chat_id="oc-chat", chat_type="dm")
+    ctx = TurnContext(source=source)
+    status = runner._run_agent_bind_turn_wiring(
+        ctx, TurnRunner(runner, ctx), source, "om-trigger", False
+    )
+    assert ctx._progress_metadata == {"message_kind": "tool_progress"}
+    assert status == {}
+
+
+@pytest.mark.asyncio
+async def test_feishu_wiring_clones_input_metadata(monkeypatch):
+    runner = _make_runner(_ProgressAdapter())
+    source = SessionSource(platform=Platform.FEISHU, chat_id="oc-chat", chat_type="group")
+    original = {"thread_id": "topic-A"}
+    monkeypatch.setattr(runner, "_run_agent_progress_threading", lambda *_: (original, "om-trigger", original))
+    ctx = TurnContext(source=source, inbound_message_id="om-inbound")
+    status = runner._run_agent_bind_turn_wiring(
+        ctx, TurnRunner(runner, ctx), source, "om-trigger", False
+    )
+    assert original == {"thread_id": "topic-A"}
+    assert status is not original
+    assert ctx._progress_metadata is not original
+    assert status is not ctx._progress_metadata
+    assert "message_kind" not in status
+
+
+@pytest.mark.asyncio
+async def test_telegram_wiring_does_not_add_cardkit_metadata():
+    adapter = _ProgressAdapter()
+    adapter.platform = Platform.TELEGRAM
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="group", thread_id="topic-A")
+    expected = runner._run_agent_progress_threading(source, "om-trigger", False)
+    ctx = TurnContext(source=source, inbound_message_id="om-inbound")
+    status = runner._run_agent_bind_turn_wiring(
+        ctx, TurnRunner(runner, ctx), source, "om-trigger", False
+    )
+    assert (ctx._progress_metadata, ctx._progress_reply_to, status) == expected
+    for metadata in (ctx._progress_metadata, status):
+        assert "message_kind" not in (metadata or {})
+        assert "_cardkit_turn_id" not in (metadata or {})
+
+
+def test_feishu_dm_explicit_reply_anchor_override_wins():
+    source = SimpleNamespace(platform=Platform.FEISHU, chat_type="dm", thread_id=None)
+    event = SimpleNamespace(source=source, message_id="om-inbound", reply_anchor_override="om-redirect")
+    assert _reply_anchor_for_event(event) == "om-redirect"

@@ -16,7 +16,7 @@ import copy
 import logging
 import json
 import re
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from gateway.platforms.base import SendResult
 
@@ -29,7 +29,7 @@ CARDKIT_ASSISTANT_PROFILE = "assistant"
 CARDKIT_TOOL_PROGRESS_PROFILE = "tool_progress"
 CARDKIT_STATIC_PROFILE = "static"
 
-CARDKIT_STREAMING_PROFILES: Dict[str, Dict[str, Any]] = {
+CARDKIT_STREAMING_PROFILES: dict[str, dict[str, Any]] = {
     CARDKIT_ASSISTANT_PROFILE: {
         "print_frequency_ms": {"default": 50},
         "print_step": {"default": 5},
@@ -78,14 +78,14 @@ def build_card(
     *,
     streaming_mode: bool,
     profile: str = CARDKIT_ASSISTANT_PROFILE,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Construct a Card JSON 2.0 dict for CardKit delivery.
 
     *streaming_mode* toggles the streaming_config block.  *profile* selects
     which streaming parameters to use (ignored when streaming_mode is False).
     """
     visible_content = strip_streaming_cursor(content or "")
-    config: Dict[str, Any] = {
+    config: dict[str, Any] = {
         "streaming_mode": bool(streaming_mode),
         "summary": {
             "content": _summary_for_content(
@@ -312,7 +312,7 @@ class FeishuStreamingCardSession:
         initial_text: str,
         *,
         reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
+        metadata: Optional[dict[str, Any]],
     ) -> SendResult:
         """Create the card, send the reference message, push initial content."""
         if self.card_id and self.message_id:
@@ -356,6 +356,7 @@ class FeishuStreamingCardSession:
                     "[Feishu] CardKit initial update failed for %s: %s",
                     self.card_id,
                     exc,
+                    exc_info=True,
                 )
                 await self.close(None)
                 return SendResult(
@@ -411,6 +412,7 @@ class FeishuStreamingCardSession:
                         "[Feishu] CardKit final update failed for %s: %s",
                         self.card_id,
                         exc,
+                        exc_info=True,
                     )
                     return SendResult(
                         success=False,
@@ -430,6 +432,7 @@ class FeishuStreamingCardSession:
                     "[Feishu] CardKit close failed for %s: %s",
                     self.card_id,
                     exc,
+                    exc_info=True,
                 )
                 return SendResult(
                     success=False,
