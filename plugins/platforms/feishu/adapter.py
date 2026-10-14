@@ -1797,6 +1797,15 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_delete_message_request(message_id)
             response = await self._run_blocking(self._client.im.v1.message.delete, request)
             if self._response_succeeded(response):
+                runtime = self._cardkit_runtime
+                if runtime is not None:
+                    try:
+                        await runtime.forget_deleted_message(chat_id, message_id)
+                    except Exception:
+                        logger.debug(
+                            "[Feishu] CardKit cleanup after deleting %s failed",
+                            message_id, exc_info=True,
+                        )
                 return True
             logger.debug(
                 "[Feishu] Delete of message %s rejected: code=%s msg=%s",

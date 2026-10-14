@@ -1,7 +1,9 @@
 """CardKit sessions follow the adapter SDK and belong to one inbound turn."""
 
+import asyncio
+
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -351,3 +353,240 @@ async def test_close_scope_retains_failed_session_and_continues(runtime_pair):
     await runtime.close_scope(scope)
     assert client.close_card.await_count == 3
     assert await runtime.edit_if_managed("oc-chat", assistant.message_id, "late") is None
+
+
+@pytest.fixture
+def lifecycle_adapter(monkeypatch, cardkit_sdk):
+    """Keep adapter, CardKit client and runtime real; replace SDK/network I/O."""
+    monkeypatch.setattr(cardkit.asyncio, "sleep", AsyncMock())
+    sdk = _make_sdk("card-A")
+    im_response = SimpleNamespace(
+        success=lambda: True, code=0, msg="", data=SimpleNamespace(message_id="om-card"),
+    )
+    sdk.im = SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(
+        delete=MagicMock(return_value=im_response),
+    )))
+    adapter = _adapter_with_runtime(None)
+    adapter._client = sdk
+    transport = AsyncMock(return_value=im_response)
+    monkeypatch.setattr(adapter, "_send_raw_message", transport)
+    client = FeishuCardKitClient(get_sdk_client=lambda: adapter._client)
+    runtime = FeishuCardKitRuntime(
+        client=client, send_card_reference=adapter._send_cardkit_reference_once,
+    )
+    adapter._cardkit_runtime = runtime
+    yield adapter, runtime, sdk, transport
+    adapter._shutdown_sdk_executor()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False], ids=["assistant", "static"])
+@pytest.mark.parametrize("close_fails", [False, True], ids=["close-success", "close-failure"])
+async def test_cancelled_reference_closes_known_card_without_fallback(lifecycle_adapter, monkeypatch, streaming, close_fails):
+    adapter, runtime, sdk, transport = lifecycle_adapter
+    reference_started, release_reference = asyncio.Event(), asyncio.Event()
+
+    async def blocked_reference(**kwargs):
+        reference_started.set()
+        await release_reference.wait()
+
+    transport.side_effect = blocked_reference
+    if close_fails:
+        sdk.cardkit.v1.card.asettings.side_effect = RuntimeError("close unavailable")
+    standard_send = AsyncMock(wraps=adapter._send_standard_message)
+    monkeypatch.setattr(adapter, "_send_standard_message", standard_send)
+    task = asyncio.create_task(adapter.send("oc-chat", "preview", metadata={"expect_edits": streaming}))
+    await asyncio.wait_for(reference_started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    sdk.cardkit.v1.card.asettings.assert_awaited_once()
+    assert sdk.cardkit.v1.card.asettings.await_args.args[0].card_id == "card-A"
+    standard_send.assert_not_awaited()
+    assert runtime._sessions == {}
+    assert runtime._sends_drained.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_initial_update_closes_known_card_without_fallback(lifecycle_adapter, monkeypatch):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    update_started, release_update = asyncio.Event(), asyncio.Event()
+
+    async def blocked_update(request):
+        update_started.set()
+        await release_update.wait()
+
+    sdk.cardkit.v1.card_element.acontent.side_effect = blocked_update
+    standard_send = AsyncMock(wraps=adapter._send_standard_message)
+    monkeypatch.setattr(adapter, "_send_standard_message", standard_send)
+    task = asyncio.create_task(adapter.send("oc-chat", "preview", metadata={"expect_edits": True}))
+    await asyncio.wait_for(update_started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    sdk.cardkit.v1.card.asettings.assert_awaited_once()
+    standard_send.assert_not_awaited()
+    assert runtime._sessions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False], ids=["assistant", "static"])
+async def test_disconnect_drains_cancelled_send_cleanup(lifecycle_adapter, streaming):
+    adapter, runtime, sdk, transport = lifecycle_adapter
+    reference_started, release_reference = asyncio.Event(), asyncio.Event()
+    cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+
+    async def blocked_reference(**kwargs):
+        reference_started.set()
+        await release_reference.wait()
+
+    async def blocked_cleanup(request):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        return SimpleNamespace(success=lambda: True)
+
+    transport.side_effect = blocked_reference
+    sdk.cardkit.v1.card.asettings.side_effect = blocked_cleanup
+    send_task = asyncio.create_task(adapter.send("oc-chat", "preview", metadata={"expect_edits": streaming}))
+    close_task = None
+    try:
+        await asyncio.wait_for(reference_started.wait(), 2)
+        send_task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), 2)
+        close_task = asyncio.create_task(runtime.close_all())
+        checkpoint = asyncio.Event()
+        asyncio.get_running_loop().call_soon(checkpoint.set)
+        await checkpoint.wait()
+        assert runtime._closing
+        assert not close_task.done()
+        assert not runtime._sends_drained.is_set()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+        await asyncio.wait_for(close_task, 2)
+        sdk.cardkit.v1.card.asettings.assert_awaited_once()
+        assert runtime._sessions == {}
+    finally:
+        release_reference.set()
+        release_cleanup.set()
+        await asyncio.gather(send_task, *([close_task] if close_task else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_delete_success_releases_managed_card(lifecycle_adapter):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    sent = await adapter.send("oc-chat", "preview", metadata={"expect_edits": True})
+
+    assert await adapter.delete_message("oc-chat", sent.message_id)
+
+    sdk.im.v1.message.delete.assert_called_once()
+    assert sdk.im.v1.message.delete.call_args.args[0].message_id == sent.message_id
+    sdk.cardkit.v1.card.asettings.assert_awaited_once()
+    assert runtime._sessions == {}
+    assert await runtime.edit_if_managed("oc-chat", sent.message_id, "late") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_failure_keeps_card_editable(lifecycle_adapter):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    sent = await adapter.send("oc-chat", "preview", metadata={"expect_edits": True})
+    sdk.im.v1.message.delete.return_value = SimpleNamespace(success=lambda: False, code=230001, msg="denied")
+
+    assert not await adapter.delete_message("oc-chat", sent.message_id)
+
+    sdk.cardkit.v1.card.asettings.assert_not_awaited()
+    assert (await adapter.edit_message("oc-chat", sent.message_id, "still editable")).success
+    assert sdk.cardkit.v1.card_element.acontent.await_args.args[0].request_body.content == "still editable"
+    assert sent.message_id in runtime._sessions
+
+
+@pytest.mark.asyncio
+async def test_delete_success_survives_card_close_failure(lifecycle_adapter):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    sent = await adapter.send("oc-chat", "preview", metadata={"expect_edits": True})
+    sdk.cardkit.v1.card.asettings.side_effect = RuntimeError("close unavailable")
+
+    assert await adapter.delete_message("oc-chat", sent.message_id)
+
+    sdk.cardkit.v1.card.asettings.assert_awaited_once()
+    assert runtime._sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_delete_unknown_or_wrong_chat_keeps_other_sessions(lifecycle_adapter):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    sent = await adapter.send("oc-chat", "preview", metadata={"expect_edits": True})
+
+    await runtime.forget_deleted_message("oc-chat", "om-unknown")
+    await runtime.forget_deleted_message("oc-other", sent.message_id)
+
+    sdk.cardkit.v1.card.asettings.assert_not_awaited()
+    assert (await adapter.edit_message("oc-chat", sent.message_id, "still editable")).success
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_active_edit_before_closing(lifecycle_adapter):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    sent = await adapter.send("oc-chat", "preview", metadata={"expect_edits": True})
+    update_started, release_update, delete_succeeded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def blocked_update(request):
+        update_started.set()
+        await release_update.wait()
+        return SimpleNamespace(success=lambda: True)
+
+    def deletion_success():
+        delete_succeeded.set()
+        return True
+
+    sdk.cardkit.v1.card_element.acontent.side_effect = blocked_update
+    sdk.im.v1.message.delete.return_value = SimpleNamespace(success=deletion_success)
+    edit_task = asyncio.create_task(adapter.edit_message("oc-chat", sent.message_id, "latest snapshot"))
+    delete_task = None
+    try:
+        await asyncio.wait_for(update_started.wait(), 2)
+        delete_task = asyncio.create_task(adapter.delete_message("oc-chat", sent.message_id))
+        await asyncio.wait_for(delete_succeeded.wait(), 2)
+        sdk.cardkit.v1.card.asettings.assert_not_awaited()
+        assert not delete_task.done()
+        release_update.set()
+        assert (await edit_task).success
+        assert await delete_task
+        close = sdk.cardkit.v1.card.asettings.await_args.args[0]
+        assert "latest snapshot" in close.request_body.settings
+        assert runtime._sessions == {}
+    finally:
+        release_update.set()
+        await asyncio.gather(edit_task, *([delete_task] if delete_task else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_delete_cleanup_preserves_replacement_session(lifecycle_adapter):
+    adapter, runtime, sdk, _ = lifecycle_adapter
+    sent = await adapter.send("oc-chat", "preview", metadata={"expect_edits": True})
+    original = runtime._sessions[sent.message_id]
+    close_started, release_close = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(request):
+        close_started.set()
+        await release_close.wait()
+        return SimpleNamespace(success=lambda: True)
+
+    sdk.cardkit.v1.card.asettings.side_effect = blocked_close
+    delete_task = asyncio.create_task(adapter.delete_message("oc-chat", sent.message_id))
+    try:
+        await asyncio.wait_for(close_started.wait(), 2)
+        sdk.cardkit.v1.card.acreate.return_value.data.card_id = "card-B"
+        replacement = await adapter.send("oc-chat", "replacement", metadata={"expect_edits": True})
+        assert replacement.message_id == sent.message_id
+        assert runtime._sessions[sent.message_id] is not original
+        release_close.set()
+        assert await delete_task
+        assert (await adapter.edit_message("oc-chat", replacement.message_id, "still editable")).success
+        assert sdk.cardkit.v1.card_element.acontent.await_args.args[0].card_id == "card-B"
+    finally:
+        release_close.set()
+        await asyncio.gather(delete_task, return_exceptions=True)

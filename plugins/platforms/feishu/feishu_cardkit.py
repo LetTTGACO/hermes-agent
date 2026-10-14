@@ -352,6 +352,9 @@ class FeishuStreamingCardSession:
                 reply_to=reply_to,
                 metadata=metadata,
             )
+        except asyncio.CancelledError:
+            await self._best_effort_close_created_card()
+            raise
         except Exception:
             # Reference send raised: the card exists but has no chat message
             # yet (self.message_id is still None), so self.close() cannot be
@@ -372,6 +375,9 @@ class FeishuStreamingCardSession:
         if text:
             try:
                 await self._push_update(text, force=True)
+            except asyncio.CancelledError:
+                await self._best_effort_close_created_card()
+                raise
             except Exception as exc:
                 logger.warning(
                     "[Feishu] CardKit initial update failed for %s: %s",
@@ -465,12 +471,10 @@ class FeishuStreamingCardSession:
             return SendResult(success=True, message_id=self.message_id)
 
     async def _best_effort_close_created_card(self) -> None:
-        """Best-effort close of a created card whose reference send failed.
+        """Close an unregistered card after setup failure or cancellation.
 
-        Used from :meth:`start` when ``self.message_id`` is still ``None``
-        (so :meth:`close` cannot be used, since it requires an active
-        session).  Swallows close errors so the original reference-send
-        failure is never masked.
+        Reference-send failure has no message ID yet, so close() cannot be
+        used. Swallow ordinary close errors to preserve the setup failure.
         """
         if not self.card_id:
             return
@@ -621,6 +625,30 @@ class FeishuCardKitRuntime:
             if result.success:
                 await self._forget_session(message_id, session)
 
+    async def forget_deleted_message(self, chat_id: str, message_id: str) -> None:
+        """Close and release the session of a successfully deleted IM message."""
+        async with self._registry_lock:
+            session = self._sessions.get(message_id)
+        if session is None or session.chat_id != chat_id:
+            return
+        try:
+            result = await session.close(None)
+            if not result.success:
+                logger.debug(
+                    "[Feishu] CardKit deleted-message close failed for %s: %s",
+                    message_id,
+                    result.error,
+                )
+        except Exception as exc:
+            logger.debug(
+                "[Feishu] CardKit deleted-message close raised for %s: %s",
+                message_id,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            await self._forget_session(message_id, session)
+
     async def close_all(self) -> None:
         async with self._close_all_lock:
             async with self._registry_lock:
@@ -681,6 +709,9 @@ class FeishuCardKitRuntime:
                 reply_to=reply_to,
                 metadata=metadata,
             )
+        except asyncio.CancelledError:
+            await self._best_effort_close(card_id, content)
+            raise
         except Exception:
             await self._best_effort_close(card_id, content)
             raise
