@@ -223,7 +223,7 @@ class TestGotDoneOverflowSplitNotRefinalized:
     carried by the split edit itself.
     """
 
-    def _consumer(self, adapter):
+    def _consumer(self, adapter, *, on_new_message=None):
         # High interval/threshold so the only edit is the got_done finalize.
         return GatewayStreamConsumer(
             adapter=adapter,
@@ -231,22 +231,22 @@ class TestGotDoneOverflowSplitNotRefinalized:
             config=StreamConsumerConfig(
                 edit_interval=10.0, buffer_threshold=10_000, cursor=" ▉",
             ),
+            on_new_message=on_new_message,
         )
 
     @pytest.mark.asyncio
-    async def test_non_split_finalize_edit_still_gets_explicit_refinalize(self):
-        """The narrow fix must not regress the requires-finalize contract:
-        a normal (non-split) got_done edit is still followed by the
-        explicit finalize edit (#25010 semantics unchanged)."""
+    async def test_non_split_finalize_edit_closes_once_with_complete_payload(self):
+        """An acknowledged got_done edit already carries the required finalize signal."""
         adapter = _make_adapter()
         adapter.REQUIRES_EDIT_FINALIZE = True
         adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
             success=True, message_id="initial_preview",
         ))
-        consumer = self._consumer(adapter)
+        sent = asyncio.Event()
+        consumer = self._consumer(adapter, on_new_message=sent.set)
         consumer.on_delta("short final reply")
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(sent.wait(), 5)
         consumer.finish()
         await task
 
@@ -254,8 +254,10 @@ class TestGotDoneOverflowSplitNotRefinalized:
             c for c in adapter.edit_message.call_args_list
             if c.kwargs.get("finalize")
         ]
-        assert len(finalize_edits) == 2
+        assert len(finalize_edits) == 1
+        assert finalize_edits[0].kwargs["content"] == "short final reply"
         assert consumer.final_response_sent is True
+        assert consumer.delivered_final_matches("short final reply") is True
 
 class TestFinalCleanupEditFloodControl:
     """Regression for duplicate final sends when the cursor-strip edit fails."""

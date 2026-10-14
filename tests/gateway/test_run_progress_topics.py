@@ -1495,12 +1495,8 @@ class TransformedStreamAgent:
 
 
 @pytest.mark.asyncio
-async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
-    """When a transform_llm_output hook modifies the response after streaming,
-    the gateway must edit the existing streamed message in place with the full
-    transformed content (so plugins like content filters / appenders reach the
-    user) and still mark already_sent=True (no duplicate send).
-    """
+async def test_transformed_response_delivers_complete_payload_once(monkeypatch, tmp_path):
+    """Authoritative finish delivers the transformed final via send or an existing-message edit."""
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1519,18 +1515,18 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
     # Final delivery happened (no duplicate send fallback).
     assert result.get("already_sent") is True
-    # The transformed final text reached the user — appended portion is present
-    # in an edit_message call (not just in the streamed sends).
-    edited_texts = [e["content"] for e in adapter.edits]
-    assert any("[plugin appended this]" in text for text in edited_texts), (
-        f"expected transformed text in adapter.edits, got: {edited_texts!r}"
-    )
+    delivered = [call["content"] for call in (*adapter.sent, *adapter.edits)]
+    assert len(adapter.sent) == 1
+    assert delivered[-1] == result["final_response"]
+    assert delivered.count(result["final_response"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_transformed_final_is_not_marked_sent_when_edit_fails(monkeypatch, tmp_path):
-    """#119323: when the in-place edit carrying a transformed final fails on a chat platform,
-    the response must not be marked already_sent, or the transformed text is never delivered."""
+async def test_transformed_durable_send_needs_no_unsupported_edit(monkeypatch, tmp_path):
+    """A transformed final sent durably before reconciliation needs no redundant edit.
+
+    Required-edit failures remain covered by the personal CardKit delivery regressions.
+    """
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1547,8 +1543,9 @@ async def test_transformed_final_is_not_marked_sent_when_edit_fails(monkeypatch,
     )
 
     assert result["final_response"].endswith("[plugin appended this]")
-    assert result.get("already_sent") is not True
-    assert len(adapter.edits) == 1
+    assert [call["content"] for call in adapter.sent] == [result["final_response"]]
+    assert result.get("already_sent") is True
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio

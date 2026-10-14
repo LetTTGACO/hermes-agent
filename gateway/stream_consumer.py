@@ -89,6 +89,7 @@ class _Tick:
     # Set by _push_update for _finalize_turn / _end_segment.
     update_visible: bool = False
     draft_final_fresh_send: bool = False
+    final_edit_delivered: bool = False
 
     @property
     def is_interim(self) -> bool:
@@ -137,8 +138,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # ``_run_agent_mark_streamed_delivery`` must not fire for it (#105341). Default True: every
         # other construction site (incl. the proxy path) creates consumers only when streaming is on.
         self.stream_deltas_enabled = True
-        # Only platforms needing an explicit finalize call (DingTalk AI Cards) force a
-        # redundant final edit; ``is True`` keeps MagicMock adapters out.
+        # Platforms needing explicit closure (DingTalk AI Cards) require a finalize
+        # edit even for unchanged text; ``is True`` keeps MagicMock adapters out.
         self._adapter_requires_finalize = getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         # Telegram bounds edit retries at 5s; a fallback must not wait longer.
         self._max_fallback_flood_retry_seconds = 5.0
@@ -155,6 +156,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._edit_supported = True  # False once progressive edits stop working
         self._last_edit_time = 0.0
         self._last_edit_overflowed = False  # last _send_or_edit split into continuations
+        self._tick_final_edit_delivered = False
         self._flood_strikes = 0
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
@@ -821,6 +823,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             self._last_sent_text = ""
             self._turn_split_delivery = True
 
+    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
+        """Remember an actual finalize edit receipt, excluding deferred/skipped edits."""
+        result = await super()._edit_message(
+            message_id=message_id, content=content, finalize=finalize)
+        raw = getattr(result, "raw_response", None)
+        if finalize and result.success and not (isinstance(raw, dict) and raw.get("skipped")):
+            self._tick_final_edit_delivered = True
+        return result
+
     async def _push_update(self, tick: _Tick) -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""
         display_text = self._accumulated
@@ -832,16 +843,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             else:
                 display_text += self.cfg.cursor
 
-        # A got_done FRESH send via the draft transport already carries finalize=True,
-        # unlike an EDIT, which REQUIRES_EDIT_FINALIZE adapters still need a pass for.
+        # A got_done fresh draft send already seals that transport. A regular fresh
+        # send still needs an explicit finalize edit on REQUIRES_EDIT_FINALIZE adapters.
         tick.draft_final_fresh_send = (tick.got_done and self._use_draft_streaming
                                        and self._message_id is None)
         # Segment break finalizes so platforms needing explicit closure (DingTalk AI
         # Cards) don't leave the segment stuck loading; it closes a preamble, not the
         # answer.
+        self._tick_final_edit_delivered = False
         tick.update_visible = await self._send_or_edit(
             display_text, finalize=tick.got_done or tick.got_segment_break,
             is_turn_final=tick.got_done)
+        tick.final_edit_delivered = self._tick_final_edit_delivered
         self._last_edit_time = time.monotonic()
         # Lines stay in _tool_progress_lines for the next compose.
         self._tool_progress_active = False
@@ -880,7 +893,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # Fresh-final already delivered; a second finalize would duplicate.
             self._mark_final_delivered(record=self._accumulated)
         elif tick.update_visible and (not self._adapter_requires_finalize
-                                      or self._last_edit_overflowed or tick.draft_final_fresh_send):
+                                      or self._last_edit_overflowed or tick.draft_final_fresh_send
+                                      or tick.final_edit_delivered):
             # The update already delivered the final.  A second finalize would re-edit
             # it (Telegram: editMessageText after sendRichMessage falls back to the
             # legacy formatter) or overflow-split again, duplicating chunks.

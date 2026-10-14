@@ -4081,7 +4081,13 @@ class GatewayTurnMixin:
         if _is_empty_sentinel:
             return
         _sk = session_key or "?"
-        if not _transformed and (_streamed or _content_delivered):
+        _exact_transformed_final = False
+        if _transformed and (_streamed or _content_delivered):
+            # finish(final_response) may have delivered the hook's authoritative output.
+            # Unlike legacy non-transformed delivery, unknown matches cannot suppress it.
+            with suppress(Exception):
+                _exact_transformed_final = _sc.delivered_final_matches(_final) is True
+        if (_streamed or _content_delivered) and (not _transformed or _exact_transformed_final):
             logger.info(
                 "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                 _sk, _streamed, _previewed, _content_delivered,
@@ -4262,9 +4268,12 @@ class GatewayTurnMixin:
                         session_key, agent_holder[0], _executor_task_holder[0]
                     ):
                         break
+                    _notify_metadata = _interim_metadata(_non_conversational_metadata(
+                        _status_thread_metadata, platform=source.platform))
+                    if source.platform == Platform.FEISHU:
+                        _notify_metadata = {**_notify_metadata, "expect_edits": True}
                     _notify_res = await _notify_adapter.send(
-                        source.chat_id, _heartbeat_text,
-                        metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
+                        source.chat_id, _heartbeat_text, metadata=_notify_metadata,
                     )
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)

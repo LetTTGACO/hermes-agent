@@ -339,11 +339,13 @@ class FeishuStreamingCardSession:
         if self.card_id and self.message_id:
             return SendResult(success=True, message_id=self.message_id)
 
+        text = strip_streaming_cursor(initial_text)
         self.card_id = await self.client.create_card(
-            content=strip_streaming_cursor(initial_text),
+            content=text,
             streaming_mode=True,
             profile=self.profile,
         )
+        self.current_text = text  # The create snapshot is already the card's content.
 
         try:
             send_result = await self.send_card_reference(
@@ -371,7 +373,6 @@ class FeishuStreamingCardSession:
 
         self.message_id = send_result.message_id
 
-        text = strip_streaming_cursor(initial_text)
         if text:
             try:
                 await self._push_update(text, force=True)
@@ -385,13 +386,8 @@ class FeishuStreamingCardSession:
                     exc,
                     exc_info=True,
                 )
-                await self.close(None)
-                return SendResult(
-                    success=False,
-                    message_id=self.message_id,
-                    error=str(exc),
-                    raw_response=getattr(send_result, "raw_response", None),
-                )
+                # The reference acknowledged this snapshot. Keep its identity and
+                # lifecycle so a redundant update failure cannot trigger a duplicate.
 
         return SendResult(
             success=True,

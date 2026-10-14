@@ -245,12 +245,24 @@ async def test_scope_is_captured_before_first_await(runtime_pair):
     runtime, client = runtime_pair
     metadata = _owned_metadata(message_kind="tool_progress")
 
-    async def create_card(**kwargs):
-        metadata.update(_owned_metadata(owner="om-new", thread="topic-B"))
-        return "card-A"
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                attempted.set()
+            return await super().acquire()
 
-    client.create_card.side_effect = create_card
-    sent = await runtime.try_send("oc-chat", "running", reply_to=None, metadata=metadata)
+    attempted = asyncio.Event()
+    runtime._registry_lock = ObservedLock()
+    async with runtime._registry_lock:
+        task = asyncio.create_task(runtime.try_send(
+            "oc-chat", "running", reply_to=None, metadata=metadata,
+        ))
+        await asyncio.wait_for(attempted.wait(), 5)
+        assert not task.done()
+        client.create_card.assert_not_awaited()
+        metadata.update(_owned_metadata(owner="om-new", thread="topic-B"))
+    sent = await asyncio.wait_for(task, 5)
+    assert runtime._sessions[sent.message_id].scope == ("oc-chat", "topic-A", "om-in")
     await runtime.close_scope(("oc-chat", "topic-A", "om-in"))
     client.close_card.assert_awaited_once()
     assert await runtime.edit_if_managed("oc-chat", sent.message_id, "late") is None

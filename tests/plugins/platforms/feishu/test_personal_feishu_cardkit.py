@@ -352,7 +352,7 @@ class TestFeishuStreamingCardSession:
         client.close_card.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_start_initial_update_failure_closes_and_fails(self):
+    async def test_start_initial_update_failure_preserves_acknowledged_snapshot(self):
         client = self._make_client_mock()
         client.update_element_content = AsyncMock(side_effect=RuntimeError("update failed"))
         send_ref = self._make_send_ref_mock()
@@ -363,8 +363,10 @@ class TestFeishuStreamingCardSession:
         )
         result = await session.start("hello", reply_to=None, metadata=None)
 
-        assert result.success is False
-        client.close_card.assert_called_once()
+        assert result.success is True
+        assert result.message_id == session.message_id
+        assert session.current_text == "hello"
+        client.close_card.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_update_pushes_merged_text(self):
