@@ -156,6 +156,7 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
     adapter = _ProgressAdapter()
+    adapter.REQUIRES_EDIT_FINALIZE = True
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = _agent_type(adapter.progress_sent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
@@ -194,6 +195,7 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(
         "_cardkit_turn_id": "om-inbound",
     }
     assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[0]["finalize"] is True
     assert adapter.edits[0]["metadata"] == {
         "thread_id": "topic_17585",
         "message_kind": "tool_progress",
