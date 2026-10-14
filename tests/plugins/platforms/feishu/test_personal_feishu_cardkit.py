@@ -50,7 +50,7 @@ class TestFeishuCardKitClient:
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
             return_value=_mock_builders(),
         ):
-            client = FeishuCardKitClient(sdk_client)
+            client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
             card_id = await client.create_card(
                 content="hello", streaming_mode=True, profile=CARDKIT_ASSISTANT_PROFILE
             )
@@ -70,7 +70,7 @@ class TestFeishuCardKitClient:
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
             return_value=_mock_builders(),
         ):
-            client = FeishuCardKitClient(sdk_client)
+            client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
             card_id = await client.create_card(
                 content="final text", streaming_mode=False, profile=CARDKIT_STATIC_PROFILE
             )
@@ -89,7 +89,7 @@ class TestFeishuCardKitClient:
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
             return_value=_mock_builders(),
         ):
-            client = FeishuCardKitClient(sdk_client)
+            client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
             with pytest.raises(RuntimeError, match="missing card_id"):
                 await client.create_card(content="hello", streaming_mode=True)
 
@@ -106,7 +106,7 @@ class TestFeishuCardKitClient:
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
             return_value=_mock_builders(),
         ):
-            client = FeishuCardKitClient(sdk_client)
+            client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
             with pytest.raises(RuntimeError, match="permission denied"):
                 await client.create_card(content="hello", streaming_mode=True)
 
@@ -122,14 +122,14 @@ class TestFeishuCardKitClient:
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
             return_value=_mock_builders(),
         ):
-            client = FeishuCardKitClient(sdk_client)
+            client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
             await client.update_element_content("card_123", "content", "hello world", 2)
         card_element_resource.acontent.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_update_element_content_over_limit(self):
         sdk_client, _, card_element_resource = self._make_sdk_client()
-        client = FeishuCardKitClient(sdk_client)
+        client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
         long_text = "a" * (MAX_CARD_TEXT_LENGTH + 1)
         with patch(
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
@@ -151,7 +151,7 @@ class TestFeishuCardKitClient:
             "plugins.platforms.feishu.feishu_cardkit._import_cardkit_sdk",
             return_value=_mock_builders(),
         ):
-            client = FeishuCardKitClient(sdk_client)
+            client = FeishuCardKitClient(get_sdk_client=lambda: sdk_client)
             await client.close_card("card_123", "final text", 5)
         card_resource.asettings.assert_called_once()
 

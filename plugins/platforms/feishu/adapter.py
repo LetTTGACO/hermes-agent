@@ -1535,7 +1535,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._cardkit_runtime = FeishuCardKitRuntime(
-                client=FeishuCardKitClient(self._client),
+                client=FeishuCardKitClient(get_sdk_client=lambda: self._client),
                 send_card_reference=self._send_cardkit_reference_once,
             )
             if self._connection_mode == "websocket":

@@ -284,8 +284,8 @@ async def test_connect_creates_cardkit_runtime_after_transport(monkeypatch):
     adapter._connection_mode = "webhook"
     adapter._verification_token = "test-token"
     class Client:
-        def __init__(self, client):
-            assert client is sdk_client
+        def __init__(self, *, get_sdk_client):
+            assert get_sdk_client() is sdk_client
             order.append("cardkit")
     monkeypatch.setattr(module, "FeishuCardKitClient", Client, raising=False)
     assert await adapter.connect() is True

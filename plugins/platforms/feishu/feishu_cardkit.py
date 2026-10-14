@@ -141,8 +141,8 @@ def _import_cardkit_sdk():
 class FeishuCardKitClient:
     """Wraps lark_oapi CardKit API calls for card create/update/close."""
 
-    def __init__(self, sdk_client: Any):
-        self.sdk_client = sdk_client
+    def __init__(self, *, get_sdk_client: Callable[[], Any]):
+        self._get_sdk_client = get_sdk_client
 
     @staticmethod
     def _ensure_success(response: Any, action: str) -> None:
@@ -159,11 +159,17 @@ class FeishuCardKitClient:
         )
         raise RuntimeError(f"Feishu CardKit {action} failed: {message}")
 
+    def _sdk_client(self) -> Any:
+        client = self._get_sdk_client()
+        if client is None:
+            raise RuntimeError("Feishu CardKit SDK client is unavailable")
+        return client
+
     def _card_resource(self) -> Any:
-        return self.sdk_client.cardkit.v1.card
+        return self._sdk_client().cardkit.v1.card
 
     def _card_element_resource(self) -> Any:
-        return self.sdk_client.cardkit.v1.card_element
+        return self._sdk_client().cardkit.v1.card_element
 
     async def create_card(
         self,
