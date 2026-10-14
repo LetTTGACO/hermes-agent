@@ -91,7 +91,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES, cache_document_from_bytes_async, cache_image_from_url,
     cache_audio_from_bytes_async, cache_image_from_bytes_async,
 )
-from plugins.platforms.feishu.feishu_cardkit import FeishuCardKitClient, FeishuCardKitRuntime
+from plugins.platforms.feishu.feishu_cardkit import FeishuCardKitClient, FeishuCardKitRuntime, cardkit_scope
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -2634,6 +2634,17 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         message_id = event.message_id
+        runtime = self._cardkit_runtime
+        source = getattr(event, "source", None)
+        if runtime is not None and source is not None:
+            scope = cardkit_scope(source.chat_id, {
+                "thread_id": source.thread_id,
+                "_cardkit_turn_id": message_id,
+            })
+            try:
+                await runtime.close_scope(scope)
+            except Exception:
+                logger.warning("[Feishu] CardKit processing cleanup failed for %s", message_id, exc_info=True)
         if not self._reactions_enabled() or not message_id:
             return
         start_reaction_id = self._pending_processing_reactions.get(message_id)

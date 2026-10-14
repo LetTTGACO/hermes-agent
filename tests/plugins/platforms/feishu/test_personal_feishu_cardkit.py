@@ -533,7 +533,7 @@ async def test_runtime_tool_progress_finalize_updates_until_next_card_closes_it(
 
     progress = await runtime.try_send(
         "oc_chat", "running", reply_to=None,
-        metadata={"message_kind": "tool_progress"},
+        metadata={"message_kind": "tool_progress", "_cardkit_turn_id": "om-in"},
     )
     update = await runtime.edit_if_managed(
         "oc_chat", progress.message_id, "running tool 2", finalize=True
@@ -542,7 +542,7 @@ async def test_runtime_tool_progress_finalize_updates_until_next_card_closes_it(
     client.close_card.assert_not_awaited()
 
     final = await runtime.try_send(
-        "oc_chat", "done", reply_to=None, metadata=None
+        "oc_chat", "done", reply_to=None, metadata={"_cardkit_turn_id": "om-in"}
     )
     assert final.success is True
     client.close_card.assert_awaited_once()
@@ -717,7 +717,7 @@ async def test_runtime_serializes_progress_update_before_sibling_close(monkeypat
         "oc_chat",
         "running",
         reply_to=None,
-        metadata={"message_kind": "tool_progress"},
+        metadata={"message_kind": "tool_progress", "_cardkit_turn_id": "om-in"},
     )
     operations.clear()
 
@@ -728,7 +728,7 @@ async def test_runtime_serializes_progress_update_before_sibling_close(monkeypat
     )
     await asyncio.wait_for(update_started.wait(), timeout=5)
     final_task = asyncio.create_task(
-        runtime.try_send("oc_chat", "done", reply_to=None, metadata=None)
+        runtime.try_send("oc_chat", "done", reply_to=None, metadata={"_cardkit_turn_id": "om-in"})
     )
     await asyncio.wait_for(sibling_close_attempted.wait(), timeout=5)
     close_overlapped_update = sibling_close_called.is_set()

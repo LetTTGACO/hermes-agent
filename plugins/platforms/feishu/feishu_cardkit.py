@@ -29,6 +29,19 @@ CARDKIT_ASSISTANT_PROFILE = "assistant"
 CARDKIT_TOOL_PROGRESS_PROFILE = "tool_progress"
 CARDKIT_STATIC_PROFILE = "static"
 
+CardKitScope = tuple[str, str | None, str]
+
+
+def cardkit_scope(chat_id: str, metadata: dict[str, Any] | None) -> CardKitScope | None:
+    """Identify the inbound turn that owns a card, independently of reply anchors."""
+    metadata = metadata or {}
+    owner = metadata.get("_cardkit_turn_id")
+    if not owner:
+        return None
+    thread_id = metadata.get("thread_id")
+    return chat_id, str(thread_id) if thread_id else None, str(owner)
+
+
 CARDKIT_STREAMING_PROFILES: dict[str, dict[str, Any]] = {
     CARDKIT_ASSISTANT_PROFILE: {
         "print_frequency_ms": {"default": 50},
@@ -301,11 +314,13 @@ class FeishuStreamingCardSession:
         chat_id: str,
         send_card_reference: SendCardReference,
         profile: str = CARDKIT_ASSISTANT_PROFILE,
+        scope: CardKitScope | None = None,
     ):
         self.client = client
         self.chat_id = chat_id
         self.send_card_reference = send_card_reference
         self.profile = profile
+        self.scope = scope
         self.card_id: Optional[str] = None
         self.message_id: Optional[str] = None
         self.sequence = 1
@@ -512,6 +527,7 @@ class FeishuCardKitRuntime:
         self._sends_drained.set()
 
     async def try_send(self, chat_id, content, *, reply_to, metadata):
+        scope = cardkit_scope(chat_id, metadata)
         if self._client is None:
             return None
         async with self._registry_lock:
@@ -520,7 +536,8 @@ class FeishuCardKitRuntime:
             self._in_flight_sends += 1
             self._sends_drained.clear()
         try:
-            await self._close_tool_progress_siblings(chat_id)
+            if scope is not None:
+                await self._close_tool_progress_siblings(scope)
             streaming, profile = self._streaming_mode(metadata)
             if streaming:
                 session = FeishuStreamingCardSession(
@@ -528,6 +545,7 @@ class FeishuCardKitRuntime:
                     chat_id=chat_id,
                     send_card_reference=self._send_reference_with_retry,
                     profile=profile,
+                    scope=scope,
                 )
                 result = await session.start(
                     content, reply_to=reply_to, metadata=metadata
@@ -578,6 +596,30 @@ class FeishuCardKitRuntime:
                 exc_info=True,
             )
             return SendResult(success=False, message_id=message_id, error=str(exc))
+
+    async def close_scope(self, scope: CardKitScope | None) -> None:
+        """Close registered cards owned by one turn, retaining failures for retry."""
+        if scope is None:
+            return
+        async with self._registry_lock:
+            sessions = [
+                (message_id, session)
+                for message_id, session in self._sessions.items()
+                if session.scope == scope
+            ]
+        for message_id, session in sessions:
+            try:
+                result = await session.close(None)
+            except Exception as exc:
+                logger.debug(
+                    "[Feishu] CardKit turn close raised for %s: %s",
+                    message_id,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            if result.success:
+                await self._forget_session(message_id, session)
 
     async def close_all(self) -> None:
         async with self._close_all_lock:
@@ -682,11 +724,11 @@ class FeishuCardKitRuntime:
             if self._sessions.get(message_id) is session:
                 self._sessions.pop(message_id, None)
 
-    async def _close_tool_progress_siblings(self, chat_id) -> None:
+    async def _close_tool_progress_siblings(self, scope: CardKitScope) -> None:
         async with self._registry_lock:
             sessions = list(self._sessions.items())
         for message_id, session in sessions:
-            if session.chat_id != chat_id:
+            if session.scope != scope:
                 continue
             if session.profile != CARDKIT_TOOL_PROGRESS_PROFILE:
                 continue
